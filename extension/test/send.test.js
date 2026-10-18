@@ -430,14 +430,21 @@ test('never waits on stop buttons or streaming markers', async () => {
   }
 });
 
-test('an unclosed tab is closed after keepMs', async () => {
-  const fc = fakeChrome((url) => new FakeSite('claudeai', url, { neverFinish: true }));
+// fire runs every pending timer and lets its async callback finish.
+async function fire(timers) {
+  timers.fireAll();
+  for (let i = 0; i < 10; i++) await null;
+}
+
+test('an unclosed tab whose answer finished is closed after keepMs', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('claudeai', url, { neverFinish: true })));
   const timers = fakeTimers();
   const s = sender(fc, { timers, keepMs: 600000 });
   const r = await s.send('claudeai', { message: 'x' });
   assert.deepEqual(timers.pending().map((t) => t.ms), [600000]);
-  timers.fireAll();
-  await null;
+  page.generating = false;
+  await fire(timers);
   assert.deepEqual(fc.log.removed, [100]);
   assert.deepEqual(await s.close('claudeai', r.conversation_id), { closed: 0 });
 
@@ -446,6 +453,75 @@ test('an unclosed tab is closed after keepMs', async () => {
   const r2 = await s2.send('claudeai', { message: 'y' });
   assert.deepEqual(await s2.close('claudeai', r2.conversation_id), { closed: 1 });
   assert.equal(timers.pending().length, 0);
+});
+
+// A ChatGPT Pro answer can take hours: a kept tab whose page still shows
+// the answer being written is not closed at keepMs, however many times it
+// comes round, and nothing more is typed into it; it closes once the
+// answer is done.
+test('a kept tab stays open while its answer is still being written (over 30 minutes), then closes', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, keepMs: 10 * 60 * 1000, now: () => fc.now() + later });
+  const r = await s.send('chatgpt', { message: 'think for an hour', new_chat: true });
+  // Six keep periods, an hour, with the page still writing.
+  for (let i = 0; i < 6; i++) {
+    later += 10 * 60 * 1000;
+    await fire(timers);
+    assert.deepEqual(fc.log.removed, [], `tab closed after ${(i + 1) * 10} minutes while the answer was still being written`);
+    assert.equal(timers.pending().length, 1);
+  }
+  assert.deepEqual(page.submitted, ['think for an hour'], 'something more was typed into the conversation');
+  assert.ok(s.busy());
+  page.generating = false;
+  later += 10 * 60 * 1000;
+  await fire(timers);
+  assert.deepEqual(fc.log.removed, [100]);
+  assert.equal(timers.pending().length, 0);
+  assert.deepEqual(await s.close('chatgpt', r.conversation_id), { closed: 0 });
+  assertOnlyFixedScripts(fc.log);
+});
+
+test('a kept tab still writing at keepMaxMs is closed anyway, and close still closes it before that', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, keepMs: 60 * 60 * 1000, keepMaxMs: 3 * 60 * 60 * 1000, now: () => fc.now() + later });
+  await s.send('chatgpt', { message: 'never ends', new_chat: true });
+  for (let i = 0; i < 2; i++) {
+    later += 60 * 60 * 1000;
+    await fire(timers);
+    assert.deepEqual(fc.log.removed, []);
+  }
+  later += 60 * 60 * 1000;
+  await fire(timers);
+  assert.deepEqual(fc.log.removed, [100]);
+  assert.equal(page.generating, true);
+  assert.equal(timers.pending().length, 0);
+
+  // The Go side's close needs no wait for the page.
+  const r2 = await s.send('chatgpt', { message: 'also long', new_chat: true });
+  later += 60 * 60 * 1000;
+  await fire(timers);
+  assert.deepEqual(await s.close('chatgpt', r2.conversation_id), { closed: 1 });
+  assert.equal(timers.pending().length, 0);
+});
+
+test('a kept tab that can no longer be probed is closed at keepMs', async () => {
+  const fc = fakeChrome((url) => new FakeSite('chatgpt', url, { neverFinish: true }));
+  const timers = fakeTimers();
+  const s = sender(fc, { timers, keepMs: 600000 });
+  await s.send('chatgpt', { message: 'x', new_chat: true });
+  const scripting = fc.chrome.scripting.executeScript;
+  fc.chrome.scripting.executeScript = async () => {
+    throw new Error('Cannot access contents of the page');
+  };
+  await fire(timers);
+  fc.chrome.scripting.executeScript = scripting;
+  assert.deepEqual(fc.log.removed, [100]);
 });
 
 test('claude.ai through fallback selectors, paste fallback, streaming marker', async () => {

@@ -602,10 +602,14 @@ func (r *Relay) Progress(ctx context.Context, id, note string) error {
 		return fmt.Errorf("check relay capabilities: %w", err)
 	}
 	if !caps.Progress {
-		return errors.New("this relay does not support progress notes (upgrade the relay)")
+		return ErrProgressUnsupported
 	}
 	return r.call(ctx, r.api, "POST", "/v1/requests/"+url.PathEscape(id)+"/progress", map[string]string{"note": note}, nil)
 }
+
+// ErrProgressUnsupported is Progress against a relay that takes no
+// progress notes.
+var ErrProgressUnsupported = errors.New("this relay does not support progress notes (upgrade the relay)")
 
 // Reply answers a request.
 func (r *Relay) Reply(ctx context.Context, id, body string, status envelope.Status) (envelope.Reply, error) {

@@ -8,9 +8,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
 // DefaultWebPollSchedule is how the conversation is read while the reply
@@ -68,6 +70,11 @@ const (
 // maxErrorBackoff caps the backoff after other transient read failures
 // (an HTTP 5xx, a flaky read).
 const maxErrorBackoff = 2 * time.Minute
+
+// DefaultWebLeaseRenew is how often a web agent posts a progress note
+// while it waits for a reply. Each note renews the claim by its lease, and
+// 4 minutes stays inside the shortest one (an urgent request's 10).
+const DefaultWebLeaseRenew = 4 * time.Minute
 
 // webClock is the reply wait's time source.
 type webClock interface {
@@ -158,10 +165,11 @@ func (w *WebAgent) stableRule() *stableRule {
 func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, onBind func(string)) (json.RawMessage, string, error) {
 	clock := w.clk()
 	// The budget is ctx's deadline on the wait's own clock.
-	budgetEnd := clock.Now().Add(DefaultWebRequestTimeout)
+	budgetEnd := clock.Now().Add(w.requestTimeout())
 	if dl, ok := ctx.Deadline(); ok {
 		budgetEnd = clock.Now().Add(time.Until(dl))
 	}
+	keep := claimKeeperFrom(ctx)
 	stable := w.stableRule()
 	op := w.live().detailOp
 	prev, seen := "", 0
@@ -172,7 +180,7 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 		if clock.Now().Add(delay).After(budgetEnd) {
 			return nil, a.bound, context.DeadlineExceeded
 		}
-		if err := clock.Sleep(ctx, delay); err != nil {
+		if err := keep.sleep(ctx, clock, delay); err != nil {
 			return nil, a.bound, err
 		}
 		raw, err := w.authRequest(ctx, op, OpArgs{ID: convID})
@@ -255,4 +263,92 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			w.logf("conversation %s: detail: %v (%s in %s)", convID, err, kind, delay)
 		}
 	}
+}
+
+// claimKeeper keeps one claimed request's lease alive while the agent
+// waits for its reply: every LeaseRenew it posts a progress note, which
+// renews the claim, so the relay never requeues (and never tells the
+// asker it lapsed) an ask whose answer is still being written, however
+// long that takes. The note says only how long the wait has run.
+type claimKeeper struct {
+	w     *WebAgent
+	id    string
+	every time.Duration
+	// start is when the request was claimed; last is the last renewal
+	// (the claim itself to begin with).
+	start, last time.Time
+	// off: the relay takes no progress notes, so there is nothing to
+	// renew with.
+	off bool
+}
+
+type claimKeeperKey struct{}
+
+// keepClaim starts keeping req's claim, made just now, alive for the rest
+// of ctx's request.
+func (w *WebAgent) keepClaim(ctx context.Context, req envelope.Request) context.Context {
+	every := w.LeaseRenew
+	if every <= 0 {
+		every = DefaultWebLeaseRenew
+	}
+	now := w.clk().Now()
+	return context.WithValue(ctx, claimKeeperKey{}, &claimKeeper{w: w, id: req.ID, every: every, start: now, last: now})
+}
+
+func claimKeeperFrom(ctx context.Context) *claimKeeper {
+	k, _ := ctx.Value(claimKeeperKey{}).(*claimKeeper)
+	return k
+}
+
+// sleep waits d on clock, renewing the claim whenever a renewal falls due
+// meanwhile, so no single wait (a long Retry-After included) outlasts the
+// lease. A nil keeper only sleeps.
+func (k *claimKeeper) sleep(ctx context.Context, clock webClock, d time.Duration) error {
+	if k == nil {
+		return clock.Sleep(ctx, d)
+	}
+	for {
+		k.renewIfDue(ctx, clock.Now())
+		if d <= 0 {
+			return nil
+		}
+		step := d
+		if !k.off {
+			step = min(step, max(k.last.Add(k.every).Sub(clock.Now()), 0))
+		}
+		if err := clock.Sleep(ctx, step); err != nil {
+			return err
+		}
+		d -= step
+	}
+}
+
+func (k *claimKeeper) renewIfDue(ctx context.Context, now time.Time) {
+	if k.off || now.Before(k.last.Add(k.every)) {
+		return
+	}
+	k.last = now
+	note := fmt.Sprintf("Still waiting for %s to finish its answer (%s so far).", siteLabel(k.w.Site), waitedText(now.Sub(k.start)))
+	pctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	err := k.w.Relay.Progress(pctx, k.id, note)
+	switch {
+	case err == nil:
+	case errors.Is(err, client.ErrProgressUnsupported):
+		k.off = true
+		k.w.logf("request %s: the relay takes no progress notes, so the claim cannot be renewed while the reply is written (upgrade the relay)", k.id)
+	default:
+		// A lapsed or moved claim refuses the note; the reply still lands
+		// on a requeued request, so the wait goes on.
+		k.w.logf("request %s: renewing the claim: %v", k.id, err)
+	}
+}
+
+// waitedText is a wait's length in whole minutes ("25m", "2h05m").
+func waitedText(d time.Duration) string {
+	m := int(d.Round(time.Minute) / time.Minute)
+	if m < 60 {
+		return fmt.Sprintf("%dm", m)
+	}
+	return fmt.Sprintf("%dh%02dm", m/60, m%60)
 }

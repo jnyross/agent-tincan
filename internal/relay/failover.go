@@ -65,7 +65,14 @@ type MoveChecker interface {
 // mentioned member), carries attachments, names a conversation, has a
 // clarification exchange or was resumed, or may have been sent already.
 func failoverIneligible(req envelope.Request, claimed bool, fromKind, toKind string) string {
-	first, _, _ := strings.Cut(req.Body, "\n")
+	first, rest, _ := strings.Cut(req.Body, "\n")
+	// A web agent reads a "timeout: <duration>" line before its threading
+	// line, so the conversation line can come second. Any timeout: first
+	// line is looked past, whatever its value: that can only keep more
+	// asks in place.
+	if isLine(first, "timeout:") {
+		first, _, _ = strings.Cut(rest, "\n")
+	}
 	switch {
 	case !onboard.IsWebChatKind(toKind):
 		return "the target is not a web chat teammate"
@@ -81,7 +88,7 @@ func failoverIneligible(req envelope.Request, claimed bool, fromKind, toKind str
 		return "it came from a room mention"
 	case len(req.Attachments) > 0:
 		return "it carries attachments"
-	case strings.HasPrefix(strings.ToLower(strings.TrimSpace(first)), "conversation:"):
+	case isLine(first, "conversation:"):
 		return "it names a conversation"
 	case len(req.Exchanges) > 0 || req.Resumed:
 		return "it has a clarification exchange"
@@ -89,6 +96,12 @@ func failoverIneligible(req envelope.Request, claimed bool, fromKind, toKind str
 		return "it may already have been sent"
 	}
 	return ""
+}
+
+// isLine reports whether line starts with prefix (lower case), ignoring
+// case and surrounding space.
+func isLine(line, prefix string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), prefix)
 }
 
 // failoverExcluded reads the owner's failover.json. Each pass reads it

@@ -72,9 +72,36 @@ func serviceConfigPath(agent string) string {
 	return filepath.Join(home, ".config", "tincan", agent+".json")
 }
 
+// webRequestTimeoutEnv sets a web agent's request timeout when
+// --request-timeout is not given (a Go duration, such as 6h).
+const webRequestTimeoutEnv = "TINCAN_WEB_REQUEST_TIMEOUT"
+
+// webRequestTimeout is web serve's request timeout: --request-timeout when
+// set, else $TINCAN_WEB_REQUEST_TIMEOUT, else zero (the site's default:
+// 4h for ChatGPT, 8m for the others). It must be above zero and at most
+// history.MaxWebRequestTimeout.
+func webRequestTimeout(flag time.Duration, flagSet bool, env string) (time.Duration, error) {
+	d, from := flag, "--request-timeout"
+	if !flagSet {
+		if env == "" {
+			return 0, nil
+		}
+		var err error
+		if d, err = time.ParseDuration(env); err != nil {
+			return 0, fmt.Errorf("%s=%q is not a duration (such as 6h): %w", webRequestTimeoutEnv, env, err)
+		}
+		from = webRequestTimeoutEnv
+	}
+	if d <= 0 || d > history.MaxWebRequestTimeout {
+		return 0, fmt.Errorf("%s must be above 0 and at most %s, got %s", from, history.MaxWebRequestTimeout, d)
+	}
+	return d, nil
+}
+
 func webServeCmd() *cobra.Command {
 	var site, configPath, allowPath, statePath, name, thread string
 	var teach bool
+	var requestTimeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run a web agent: answer teammates by asking ChatGPT, Claude, Grok, Gemini, Perplexity or Copilot in your browser",
@@ -89,6 +116,9 @@ func webServeCmd() *cobra.Command {
 			"  3. the Tincan Chrome extension types it into the site in a background tab and sends it; the service then reads the conversation until the reply is finished;\n" +
 			"  4. the reply text (capped) comes back; ChatGPT and Grok attach their generated images, Gemini's when they can be fetched,\n" +
 			"     and Perplexity's and Copilot's answers end with their source links.\n" +
+			"One request waits up to --request-timeout for its answer (default 4h for ChatGPT, whose Pro answers take hours, 8m for\n" +
+			"the others; also $" + webRequestTimeoutEnv + "). A line \"timeout: <duration>\" (such as timeout: 6h), first or after the threading line, sets one request's own,\n" +
+			"up to 24h. While it waits the agent posts a progress note every 4 minutes, which keeps its claim, so the relay never requeues it.\n" +
 			"Normally started by the service definition tincan web install writes.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -102,6 +132,10 @@ func webServeCmd() *cobra.Command {
 			}
 			if teach && !history.WebSiteTakesThread(src) {
 				return fmt.Errorf("--teach applies only to --site dots, not %s", src)
+			}
+			timeout, err := webRequestTimeout(requestTimeout, cmd.Flags().Changed("request-timeout"), os.Getenv(webRequestTimeoutEnv))
+			if err != nil {
+				return err
 			}
 			if name == "" {
 				name = history.WebAgentName(src)
@@ -186,6 +220,7 @@ func webServeCmd() *cobra.Command {
 				PassedPath:  history.DefaultWebPassedPath(src),
 				// An older build kept the list under the agent's name.
 				LegacyPassedPath: history.LegacyWebPassedPath(name),
+				RequestTimeout:   timeout,
 				Log:              cmd.ErrOrStderr(),
 			}
 			cmd.PrintErrf("tincan web %s: serving %s on %s (%s)\n", name, src, cfg.Relay, history.DescribeAllowlist(allowPath, allowed))
@@ -217,6 +252,7 @@ func webServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&allowPath, "allowlist", "", "file of agents allowed to ask, one per line (default ~/.config/tincan/<name>-allow.txt; missing or * means every joined agent)")
 	cmd.Flags().StringVar(&statePath, "state", "", "where each asker's last conversation id is kept (default ~/.config/tincan/<name>-state.json)")
 	cmd.Flags().StringVar(&thread, "thread", "", "--site dots only (required there): the dot's thread id, which tincan web install --site dots finds and keeps in the service")
+	cmd.Flags().DurationVar(&requestTimeout, "request-timeout", 0, "how long one request may wait for its answer (default: 4h for --site chatgpt, 8m for the others; $"+webRequestTimeoutEnv+" when unset; at most 24h)")
 	cmd.Flags().BoolVar(&teach, "teach", false, "--site dots only: type the setup message that teaches the dot to ask teammates into its DM again (it is sent once per thread on its own)")
 	return cmd
 }

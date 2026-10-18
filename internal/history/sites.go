@@ -107,6 +107,14 @@ type webSite struct {
 	// dot's DM), given with --thread. Every request goes there, the
 	// threading first line is sent as text, and each send names it.
 	oneThread bool
+	// requestTimeout, when set, replaces DefaultWebRequestTimeout as the
+	// site's bound on one request (ChatGPT's Pro answers take hours).
+	requestTimeout time.Duration
+	// refuseWhileAnswering: the site marks an answer finished reliably,
+	// so a send into a conversation whose latest answer is still being
+	// written is refused before anything is typed (the extension's page
+	// check refuses it too).
+	refuseWhileAnswering bool
 }
 
 // ConversationName is how a web agent's reply footer names a site's
@@ -174,8 +182,10 @@ var webSites = []*webSite{
 			r.Now = now
 			return r
 		},
-		nodes:    chatgptNodes,
-		convPath: convURLPattern,
+		nodes:                chatgptNodes,
+		convPath:             convURLPattern,
+		requestTimeout:       DefaultChatGPTRequestTimeout,
+		refuseWhileAnswering: true,
 	},
 	{
 		source:        SourceClaudeAI,
