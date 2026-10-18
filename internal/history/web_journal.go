@@ -1,21 +1,27 @@
 package history
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/mvanhorn/agent-tincan/internal/client"
+	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
-// DefaultWebJournalRetention is how long a send journal entry is kept after
-// it was last written or touched: the relay's default request lifetime
-// (24 hours; a request the relay requeues after that has expired instead),
-// plus its 30-minute claim lease (after which it requeues a claim that went
-// quiet, as when the agent crashed) and a margin for a second requeue. A
-// wait touches its entry at every claim renewal, so a wait of any length
-// keeps it. An entry pruned while its request could still come back would
-// let the request be typed into its conversation a second time.
+// DefaultWebJournalRetention is how long after it was last written or
+// touched a send journal entry is kept before the agent asks the relay
+// whether its request is finished (pruneSettledJournal). Age alone never
+// drops an entry: a chatgpt-web request never expires at the relay, so one
+// whose agent was offline for days still comes back, and an entry dropped
+// while its request could still come back would let it be typed into its
+// conversation a second time. Only once the relay says the request is
+// finished (answered, failed, declined, cancelled, expired) or no longer
+// this agent's is its entry dropped.
 const DefaultWebJournalRetention = 24*time.Hour + 30*time.Minute + time.Hour
 
 // webJournal is the send journal: request id -> what was sent for it. It
@@ -55,8 +61,9 @@ func (w *WebAgent) journalRetention() time.Duration {
 	return DefaultWebJournalRetention
 }
 
-// loadJournal reads the journal, dropping entries past the retention and
-// ones whose ids are malformed. A missing or unreadable journal is empty.
+// loadJournal reads the journal, dropping entries whose ids are malformed.
+// It never drops one for its age (see pruneSettledJournal). A missing or
+// unreadable journal is empty.
 func (w *WebAgent) loadJournal() webJournal {
 	j := webJournal{Requests: map[string]webSend{}}
 	if w.JournalPath == "" {
@@ -76,16 +83,71 @@ func (w *WebAgent) loadJournal() webJournal {
 	if j.Requests == nil {
 		j.Requests = map[string]webSend{}
 	}
-	cutoff := time.Now().Add(-w.journalRetention())
 	for id, e := range j.Requests {
 		if e.State == webSendIntent || (e.Input && e.State != webSendAnswered) {
 			continue
 		}
-		if e.Recorded.Before(cutoff) && e.Touched.Before(cutoff) || !validNativeID(e.ConversationID) || (e.UserMessageID != "" && !validNativeID(e.UserMessageID)) {
+		if !validNativeID(e.ConversationID) || (e.UserMessageID != "" && !validNativeID(e.UserMessageID)) {
 			delete(j.Requests, id)
 		}
 	}
 	return j
+}
+
+// pruneSettledJournal drops the journal entries older than the retention
+// whose requests the relay says are finished, or are no longer this
+// agent's (not found). An entry whose request is still live (held, queued,
+// delivered, claimed or waiting for input), or whose status could not be
+// read (the relay unreachable), is kept, however old: a request can come
+// back after any outage, and its entry is what stops it being sent again.
+// Unresolved image intents are never dropped, as before. A journal that
+// cannot be read safely is left as it is. Callers hold w.mu.
+func (w *WebAgent) pruneSettledJournal(ctx context.Context) {
+	if w.JournalPath == "" || w.Relay == nil {
+		return
+	}
+	j, err := w.loadInputJournal()
+	if err != nil {
+		return
+	}
+	cutoff := w.clk().Now().Add(-w.journalRetention())
+	changed := false
+	for id, e := range j.Requests {
+		if e.State == webSendIntent || (e.Input && e.State != webSendAnswered) {
+			continue
+		}
+		if !e.Recorded.Before(cutoff) || !e.Touched.Before(cutoff) {
+			continue
+		}
+		if w.requestSettled(ctx, id) {
+			delete(j.Requests, id)
+			changed = true
+		}
+	}
+	if changed {
+		if err := w.writeJournal(j); err != nil {
+			w.logf("journal %s: %v", w.JournalPath, err)
+		}
+	}
+}
+
+// requestSettled reports whether the relay says request id is finished or
+// no longer this agent's. Any other answer, an error included, is false.
+func (w *WebAgent) requestSettled(ctx context.Context, id string) bool {
+	if !validNativeID(id) {
+		return true
+	}
+	gctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	res, err := w.Relay.Get(gctx, id, 0)
+	if err != nil {
+		return client.IsStatus(err, http.StatusNotFound) || client.IsStatus(err, http.StatusForbidden)
+	}
+	switch res.Status {
+	case envelope.StatusAnswered, envelope.StatusFailed, envelope.StatusDeclined, envelope.StatusCancelled, envelope.StatusExpired:
+		return true
+	}
+	return false
 }
 
 // journal records (or updates) reqID's entry and prunes old ones. Callers
@@ -150,6 +212,11 @@ func (w *WebAgent) journalStrict(reqID string, e webSend) error {
 		return err
 	}
 	j.Requests[reqID] = e
+	return w.writeJournal(j)
+}
+
+// writeJournal replaces the journal with j, synced to disk (0600).
+func (w *WebAgent) writeJournal(j webJournal) error {
 	b, err := json.MarshalIndent(j, "", "  ")
 	if err != nil {
 		return err

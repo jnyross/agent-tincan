@@ -491,3 +491,81 @@ func TestWebNeverTypesIntoAConversationStillAnswering(t *testing.T) {
 		t.Fatalf("new chat: %s %q", res.Status, res.Reply.Body)
 	}
 }
+
+// No follow-up across an outage (fix round 2), behaviourally: the agent
+// sends an ask, then dies on its first read of the reply (no reply reaches
+// the relay), and stays down longer than the send journal's retention: 27
+// hours, and 30 days. A chatgpt-web ask never expires at the relay, so when
+// the agent comes back the relay hands it the request again. It must resume
+// from its journal and answer it, never type it into ChatGPT a second time.
+// Before the fix the journal dropped the entry for its age alone, and the
+// restarted agent sent the message again into a new chat.
+func TestWebOutageLongerThanJournalRetentionIsNeverSentTwice(t *testing.T) {
+	for _, outage := range []time.Duration{27 * time.Hour, 30 * 24 * time.Hour} {
+		t.Run(outage.String(), func(t *testing.T) {
+			rig, clock := newLongRig(t)
+			withTab(rig, &fakeTab{})
+			rig.browser.inProgress = 3
+			ctx := t.Context()
+			grok := rig.mesh.Client(t, "grokbot")
+			const prompt = "Must never be submitted twice"
+			req, err := grok.Send(ctx, "chatgpt-web", "new chat\n"+prompt, envelope.KindAsk, "", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// First delivery: the send goes through and is journalled, then
+			// the process is lost on the first read of the reply. The panic
+			// skips handleSafely, as a crash skips its failure reply.
+			live := rig.agent.Native
+			rig.agent.Native = &Client{Channel: channelFunc(func(ctx context.Context, r NativeRequest, recv func(NativeResponse) (bool, error)) error {
+				if r.Op == OpChatGPTDetail {
+					panic("simulated process loss")
+				}
+				return live.Channel.Exchange(ctx, r, recv)
+			})}
+			n, err := PollAndHandle(ctx, rig.agent.Relay, time.Second, "web-serve", func(ctx context.Context, r envelope.Request) {
+				defer func() { _ = recover() }()
+				rig.agent.Handle(ctx, r)
+			})
+			if err != nil || n != 1 {
+				t.Fatalf("first delivery: %d %v", n, err)
+			}
+			rig.agent.Native = live
+			if got := rig.browser.sent(); len(got) != 1 {
+				t.Fatalf("first delivery sends = %d", len(got))
+			}
+			e, ok := rig.agent.loadJournal().Requests[req.ID]
+			if !ok {
+				t.Fatal("the send was not journalled")
+			}
+
+			// The outage: the agent's journal entry and the relay both age by
+			// it (the journal by the wall clock too, which the old prune read).
+			e.Recorded = time.Now().Add(-outage).UTC()
+			e.Touched = e.Recorded
+			rig.agent.journal(req.ID, e)
+			clock.mu.Lock()
+			clock.t = clock.t.Add(outage)
+			clock.mu.Unlock()
+			rig.mesh.Server.Sweep(ctx)
+			if res, err := grok.Get(ctx, req.ID, 0); err != nil || res.Status != envelope.StatusQueued {
+				t.Fatalf("after the outage the request is %s (%v), want queued for redelivery", res.Status, err)
+			}
+
+			// The agent comes back and the relay hands it the request again.
+			if n, err := rig.agent.PollOnce(ctx); err != nil || n != 1 {
+				t.Fatalf("after the outage PollOnce = %d, %v", n, err)
+			}
+			res, err := grok.Get(ctx, req.ID, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := rig.browser.sent(); len(got) != 1 {
+				t.Fatalf("sends = %d after a %s outage: the request was typed into ChatGPT again", len(got), outage)
+			}
+			if res.Status != envelope.StatusAnswered || !strings.Contains(replyBody(res), "You said: "+prompt) {
+				t.Fatalf("after the outage: %s %q", res.Status, replyBody(res))
+			}
+		})
+	}
+}
