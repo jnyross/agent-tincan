@@ -197,14 +197,17 @@ func assertAnsweredOnce(t *testing.T, rig *webRig, res envelope.Result, clock *r
 	}
 }
 
-// Limit (a), behaviourally: chatgpt-web on its defaults has no deadline. A
+// Limit (a), behaviourally: chatgpt-web with no deadline set has none. A
 // ChatGPT answer still being written at 6 hours (it finishes at about 6.5)
 // is delivered, not cut off; on the way the asker can read the agent's
 // progress note, and the relay never requeues it.
 func TestWebLongChatGPTAnswerIsDelivered(t *testing.T) {
 	rig, clock := newLongRig(t)
 	withTab(rig, &fakeTab{})
-	rig.browser.inProgress = 1170 // reads at 20s: about 6.5 hours
+	// One read a minute keeps hours of answer cheap under -race; the claim
+	// is still renewed every 4 minutes inside each wait.
+	rig.agent.PollInterval = time.Minute
+	rig.browser.inProgress = 390 // about 6.5 hours
 	const prompt = "Think as long as you need about tin cans"
 	ctx := t.Context()
 	grok := rig.mesh.Client(t, "grokbot")
@@ -249,16 +252,15 @@ func TestWebLongAnswerKeepsItsClaim(t *testing.T) {
 }
 
 // The stuck check, behaviourally: with no deadline, an answer that is
-// written for 2 hours and then dies (its tab closed, or its page no longer
-// showing it, with the conversation unchanged) ends the ask cleanly a few
-// minutes later: failed, saying where to look, with its tab closed, sent
-// once and never requeued. It is the page and the conversation that end
-// it, not the clock.
+// written for 2 hours and then dies (its tab closed, with the conversation
+// unchanged) ends the ask cleanly a few minutes later: failed, saying where
+// to look, with its tab closed, sent once and never requeued. It is the
+// tab and the conversation that end it, not the clock.
 func TestWebStuckTabEndsTheAskCleanly(t *testing.T) {
 	for _, c := range []struct {
 		name       string
 		dead, idle bool
-	}{{"tab closed", true, false}, {"page idle", false, true}} {
+	}{{"tab closed", true, false}} {
 		t.Run(c.name, func(t *testing.T) {
 			rig, clock := newLongRig(t)
 			tab := &fakeTab{}
@@ -282,6 +284,98 @@ func TestWebStuckTabEndsTheAskCleanly(t *testing.T) {
 			}
 		})
 	}
+}
+
+// silentAPI makes the conversation's reads show the answer in progress
+// with no text at all, as ChatGPT Pro does while it thinks: no reply text
+// grows, so nothing in the conversation changes until it finishes.
+func silentAPI(rig *webRig) {
+	inner := rig.agent.Native.Channel
+	rig.agent.Native = &Client{Channel: channelFunc(func(ctx context.Context, req NativeRequest, recv func(NativeResponse) (bool, error)) error {
+		if req.Op != OpChatGPTDetail {
+			return inner.Exchange(ctx, req, recv)
+		}
+		return inner.Exchange(ctx, req, func(r NativeResponse) (bool, error) {
+			var d map[string]any
+			if json.Unmarshal(r.Result, &d) == nil {
+				if nodes, ok := d["mapping"].(map[string]any); ok {
+					for _, v := range nodes {
+						n, _ := v.(map[string]any)
+						if m, _ := n["message"].(map[string]any); m["status"] == "in_progress" {
+							m["content"] = map[string]any{"content_type": "text", "parts": []any{""}}
+						}
+					}
+					r.Result, _ = json.Marshal(d)
+				}
+			}
+			return recv(r)
+		})
+	})}
+}
+
+// P1 (fix round 1), behaviourally: ChatGPT Pro thinks for over 2 hours with
+// no token output and no stop button or streaming mark the extension knows:
+// its tab is open and reports neither writing nor anything to count. The
+// conversation shows the answer in progress with no text. The ask is never
+// declared stuck while it thinks; it is answered once the answer comes,
+// sent once and never requeued. Before the fix it failed as stuck after
+// 4m30s.
+func TestWebProThinkingWithNoMarkIsNeverStuck(t *testing.T) {
+	rig, clock := newLongRig(t)
+	withTab(rig, &fakeTab{idle: true})
+	silentAPI(rig)
+	rig.agent.PollInterval = time.Minute
+	rig.browser.inProgress = 135 // a little over 2 hours
+	res, id := askOnce(t, rig, "Think silently for two hours", false)
+	assertAnsweredOnce(t, rig, res, clock, id, "Think silently for two hours", 2*time.Hour)
+}
+
+// P1 (fix round 1), behaviourally: a second ask queued behind a ChatGPT
+// answer that takes over a day is not expired at the relay's 24 hours: at
+// 26 hours it is still queued, with no relay note, and it is answered after
+// the long one. Before the fix it expired at 24 hours ("This request
+// expired after 24h with no reply").
+func TestWebSecondAskQueuedPast24HoursIsNotExpired(t *testing.T) {
+	rig, clock := newLongRig(t)
+	withTab(rig, &fakeTab{})
+	// Reads every 5 minutes instead of on the 20-second cadence, so over a
+	// day of answer takes 320 reads; the claim is still renewed every 4
+	// minutes inside each wait.
+	rig.agent.PollInterval = 5 * time.Minute
+	rig.browser.inProgress = 320 // about 26h40m
+	ctx := context.Background()
+	muse := rig.mesh.Client(t, "muse")
+	var second string
+	var at26h envelope.Result
+	clock.at(time.Hour, func() {
+		req, err := muse.Send(ctx, "chatgpt-web", "new chat\nQueued for over a day", envelope.KindAsk, "", false)
+		if err != nil {
+			t.Error(err)
+		}
+		second = req.ID
+	})
+	clock.at(26*time.Hour, func() { at26h, _ = muse.Get(ctx, second, 0) })
+	first, firstID := askOnce(t, rig, "More than a day", false)
+	assertAnsweredOnce(t, rig, first, clock, firstID, "More than a day", 26*time.Hour)
+	if second == "" || at26h.Status != envelope.StatusQueued || at26h.RelayNote != nil {
+		note := ""
+		if at26h.RelayNote != nil {
+			note = at26h.RelayNote.Note
+		}
+		t.Fatalf("at 26h the second ask was %s, relay note %q", at26h.Status, note)
+	}
+	rig.browser.inProgress = 1
+	if n, err := rig.agent.PollOnce(t.Context()); err != nil || n != 1 {
+		t.Fatalf("second PollOnce = %d, %v", n, err)
+	}
+	res, err := muse.Get(t.Context(), second, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != envelope.StatusAnswered || !strings.Contains(replyBody(res), "You said: Queued for over a day") {
+		t.Fatalf("second ask: %s %q", res.Status, replyBody(res))
+	}
+	assertNeverRequeued(t, rig, res, second)
 }
 
 // The per-ask deadline is opt-in: an ask whose first line is "timeout: 30m"
@@ -311,7 +405,8 @@ func TestWebPerAskDeadlineStillWorks(t *testing.T) {
 func TestWebSecondAskDuringALongOneIsQueuedThenServed(t *testing.T) {
 	rig, clock := newLongRig(t)
 	withTab(rig, &fakeTab{})
-	rig.browser.inProgress = 1100 // about 6 hours
+	rig.agent.PollInterval = time.Minute
+	rig.browser.inProgress = 365 // about 6 hours
 	ctx := context.Background()
 	muse := rig.mesh.Client(t, "muse")
 	var second string

@@ -82,6 +82,9 @@ func TestParseWebRequestTimeoutLine(t *testing.T) {
 		{"conversation: abc-123\ntimeout: 6h\nhello", "hello", "abc-123", threadConversation, 6 * time.Hour},
 		{"timeout: 1h\nnew chat\ntimeout: 6h\nhello", "timeout: 6h\nhello", "", threadNew, time.Hour},
 		{"hello\ntimeout: 6h", "hello\ntimeout: 6h", "", threadContinue, 0},
+		// Leading blank lines before the timeout line: the relay's failover
+		// reads the same request as naming a conversation.
+		{"\n\ntimeout: 6h\nconversation: abc-123\nhello", "hello", "abc-123", threadConversation, 6 * time.Hour},
 	} {
 		wr, err := parseWebRequest(c.body)
 		if err != nil || wr.message != c.msg || wr.mode != c.mode || wr.convID != c.conv || wr.timeout != c.timeout {
@@ -133,11 +136,12 @@ func tabChannel(fb *fakeBrowser, state func() (TabState, *NativeError)) channelF
 	}
 }
 
-// The stuck watch, read by read: a changing reply, a page that shows the
-// answer being written or a growing answer text each count as alive and
-// start the count again; StuckChecks reads in a row with none end the wait;
-// so do StuckChecks not-found reads, whatever the tab shows. An extension
-// that cannot report its tab is never taken as stuck.
+// The stuck watch, read by read: a changing reply or a tab still open on
+// its conversation, whatever its page shows, counts as alive and starts
+// the count again; StuckChecks reads in a row with the tab dead and the
+// reply unchanged end the wait; so do StuckChecks not-found reads, whatever
+// the tab shows. An extension that cannot report its tab is never taken as
+// stuck.
 func TestWebStuckWatchCountsOnlyReadsWithNoSignOfLife(t *testing.T) {
 	rig := newWebRig(t)
 	rig.agent.StuckChecks = 3
@@ -156,12 +160,12 @@ func TestWebStuckWatchCountsOnlyReadsWithNoSignOfLife(t *testing.T) {
 	for range 10 {
 		step("same", nil, nil) // a page writing its answer stays alive however long
 	}
-	st = TabState{Open: true, AssistantChars: 10}
-	step("same", nil, nil) // the answer grew on the page
-	step("same", nil, nil)
-	step("same", nil, nil)
+	st = TabState{Open: true}
+	for range 50 {
+		step("same", nil, nil) // an open tab showing nothing (a silent Pro think) is alive
+	}
 	step("grew", nil, nil) // the conversation's reply changed
-	st = TabState{}        // the tab is gone
+	st = TabState{}        // the tab is dead (closed, crashed, moved away)
 	step("grew", nil, nil)
 	step("grew", errors.New("flaky read"), nil)
 	step("grew", nil, errStuck)

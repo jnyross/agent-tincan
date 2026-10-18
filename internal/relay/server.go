@@ -2405,11 +2405,25 @@ func (s *Server) requestTTL(ctx context.Context, agent string) time.Duration {
 		log.Printf("request ttl: look up %s: %v (using notes ttl %v)", agent, err, s.cfg.NotesRequestTTL)
 		return s.cfg.NotesRequestTTL
 	}
-	if ok && a.Kind == onboard.KindNotes {
+	switch {
+	case ok && a.Kind == onboard.KindNotes:
 		return s.cfg.NotesRequestTTL
+	case ok && a.Kind == onboard.KindChatGPTWeb,
+		// chatgpt-web invited without --kind still gets its lifetime. Only
+		// this kind falls back to the product name: the others keep the
+		// relay's lifetime until their kind is set.
+		a.Kind == "" && onboard.RuntimeKind(agent) == onboard.KindChatGPTWeb:
+		return NoRequestExpiry
 	}
 	return s.cfg.RequestTTL
 }
+
+// NoRequestExpiry is the lifetime of a request to a chatgpt-web teammate.
+// Its answers have no deadline (a ChatGPT Pro answer can take hours), and
+// it answers one request at a time, so an ask queued behind a long one
+// must not expire while it waits: this is far enough off never to come,
+// and still a valid time everywhere the relay stores or shows one.
+const NoRequestExpiry = 100 * 365 * 24 * time.Hour
 
 // notifyApproval tells the owner a request is held: through the approval
 // policy's notify teammate, then by push to every subscribed admin phone.

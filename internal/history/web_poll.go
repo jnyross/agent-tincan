@@ -72,10 +72,10 @@ const (
 const maxErrorBackoff = 2 * time.Minute
 
 // DefaultWebStuckChecks is how many reads in a row a request with no
-// deadline may show no sign of its answer being written before it ends as
-// stuck (stuckWatch): at the 20-second read cadence, about 5 minutes of
-// reads. It is a count of reads that each found nothing alive, not a
-// deadline: one sign of life starts the count again.
+// deadline may find its tab dead and its conversation unchanged before it
+// ends as stuck (stuckWatch): at the 20-second read cadence, about 5
+// minutes of reads. It is a count of reads that each found the tab dead,
+// not a deadline: an open tab or a changed reply starts the count again.
 const DefaultWebStuckChecks = 15
 
 // DefaultWebLeaseRenew is how often a web agent posts a progress note
@@ -380,19 +380,23 @@ func (k *claimKeeper) renewIfDue(ctx context.Context, now time.Time) {
 // being written any more; errConversationGone one whose conversation can
 // no longer be read at all.
 var (
-	errStuck            = errors.New("the answer stopped: its tab is gone or idle and the conversation has not changed")
+	errStuck            = errors.New("the answer stopped: its tab is dead and the conversation has not changed")
 	errConversationGone = errors.New("the conversation is gone")
 )
 
 // stuckWatch decides when a request with no deadline is dead, from what
-// the page and the conversation show rather than from the clock. After
-// every read that does not find the answer finished, the answer counts as
-// alive when the conversation's reply changed since the last read, or the
-// send's tab is open and its page shows the answer being written (the
-// site's stop button or streaming mark) or its answer text grew. Only
-// limit reads in a row with none of those end the request (errStuck).
-// The conversation itself being unreadable as not found for limit reads in
-// a row ends it too (errConversationGone), whatever the tab shows. An
+// the tab and the conversation show rather than from the clock. After every
+// read that does not find the answer finished, the answer counts as alive
+// when the conversation's reply changed since the last read, or the send's
+// tab is still open on its conversation, whatever its page shows: ChatGPT
+// Pro can think for hours with no stop button, streaming mark or answer
+// text showing, so an idle-looking page is never taken for a dead one (the
+// extension also reads its thinking and reasoning marks, and keeps the tab
+// while this watch reads it). Only limit reads in a row that find the tab
+// dead (closed, crashed, sent off the site or moved to another
+// conversation) with the reply unchanged end the request (errStuck). The
+// conversation itself being unreadable as not found for limit reads in a
+// row ends it too (errConversationGone), whatever the tab shows. An
 // extension that cannot report its tab (one older than this release) is
 // taken as alive, so with it only a finished answer, an error that will
 // not clear or a gone conversation ends the request.
@@ -401,7 +405,6 @@ type stuckWatch struct {
 	convID string
 	limit  int
 	sig    string
-	chars  int
 	// idle and missing count reads in a row with no sign of life and with
 	// the conversation not found.
 	idle, missing int
@@ -445,20 +448,15 @@ func (s *stuckWatch) check(ctx context.Context, sig string, readErr error) error
 			s.w.logf("conversation %s: the extension cannot report its tab (%v); waiting for the answer without the stuck check", s.convID, err)
 		}
 		alive = true
-	case st.Open && st.Generating:
+	case st.Open:
 		alive = true
-	case st.Open && st.AssistantChars != s.chars:
-		alive = true
-	}
-	if err == nil {
-		s.chars = st.AssistantChars
 	}
 	if alive {
 		s.idle = 0
 		return nil
 	}
 	if s.idle++; s.idle >= s.limit {
-		s.w.logf("conversation %s: no sign of the answer being written on %d reads in a row (tab open %t); ending the request", s.convID, s.idle, st.Open)
+		s.w.logf("conversation %s: its tab dead and the conversation unchanged on %d reads in a row; ending the request", s.convID, s.idle)
 		return errStuck
 	}
 	return nil

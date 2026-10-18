@@ -65,13 +65,14 @@ type MoveChecker interface {
 // mentioned member), carries attachments, names a conversation, has a
 // clarification exchange or was resumed, or may have been sent already.
 func failoverIneligible(req envelope.Request, claimed bool, fromKind, toKind string) string {
-	first, rest, _ := strings.Cut(req.Body, "\n")
-	// A web agent reads a "timeout: <duration>" line before its threading
-	// line, so the conversation line can come second. Any timeout: first
-	// line is looked past, whatever its value: that can only keep more
-	// asks in place.
+	// A web agent reads a "timeout: <duration>" line, after any blank
+	// lines, before its threading line, so the conversation line can come
+	// second. Leading blank lines and any timeout: first line, whatever its
+	// value, are looked past, as are blank lines after it: that can only
+	// keep more asks in place.
+	first, rest, _ := strings.Cut(strings.TrimLeft(req.Body, " \t\r\n"), "\n")
 	if isLine(first, "timeout:") {
-		first, _, _ = strings.Cut(rest, "\n")
+		first, _, _ = strings.Cut(strings.TrimLeft(rest, " \t\r\n"), "\n")
 	}
 	switch {
 	case !onboard.IsWebChatKind(toKind):
