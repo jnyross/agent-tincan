@@ -171,6 +171,10 @@ const (
 	OpChatGPTClose  Op = "chatgpt.close"
 	OpClaudeAIClose Op = "claudeai.close"
 	OpGrokClose     Op = "grok.close"
+	// OpChatGPTTab reads the tab a send left open for a conversation (is
+	// it open, does the page show the answer being written); every site
+	// has its own <prefix>.tab. It reaches no site.
+	OpChatGPTTab Op = "chatgpt.tab"
 	// Gemini (gemini.google.com). gemini.file takes the conversation id
 	// and "<response candidate id>-<n>", never a URL.
 	OpGeminiList   Op = "gemini.list"
@@ -263,7 +267,7 @@ func ValidateOp(op Op, a OpArgs) error {
 			return fmt.Errorf("%s: needs the thread as its conversation id", op)
 		}
 		return nil
-	case opClose:
+	case opClose, opTab:
 		if a != (OpArgs{ConversationID: a.ConversationID}) || !validNativeID(a.ConversationID) {
 			return fmt.Errorf("%s: takes only a valid conversation id", op)
 		}
@@ -716,7 +720,7 @@ const cooldownDetail = "cooling down after a rate limit"
 // hitsSite reports whether op makes a request to the site. Closing a tab
 // does not, so it runs during a cooldown.
 func (op Op) hitsSite() bool {
-	return !op.is(opClose) && op != OpExtensionReload
+	return !op.is(opClose) && !op.is(opTab) && op != OpExtensionReload
 }
 
 // ExtensionStatus is the native host's answer to OpHostStatus.
@@ -972,6 +976,35 @@ func (c *Client) Close(ctx context.Context, src Source, convID string) error {
 	}
 	_, err = c.Request(ctx, site.op(opClose), OpArgs{ConversationID: convID})
 	return err
+}
+
+// TabState is what the extension sees of the tab a send left open for a
+// conversation: whether it is still open, whether its page shows the
+// answer being written (the site's stop button or streaming mark), and the
+// length of the page's last answer text, which grows while it is written.
+// It is read from the page only (the same read-only probe a send uses).
+type TabState struct {
+	Open           bool `json:"open"`
+	Generating     bool `json:"generating"`
+	AssistantChars int  `json:"assistant_chars"`
+}
+
+// TabState reads the tab a send left open for convID on src (TabState).
+// An extension that predates the operation answers with an error.
+func (c *Client) TabState(ctx context.Context, src Source, convID string) (TabState, error) {
+	site, err := lookupSite(src)
+	if err != nil {
+		return TabState{}, err
+	}
+	raw, err := c.Request(ctx, site.op(opTab), OpArgs{ConversationID: convID})
+	if err != nil {
+		return TabState{}, err
+	}
+	var st TabState
+	if err := json.Unmarshal(raw, &st); err != nil {
+		return TabState{}, unavailable(src, ErrEndpointChanged, "unexpected tab state")
+	}
+	return st, nil
 }
 
 // File runs a file operation and reassembles its chunks, enforcing the

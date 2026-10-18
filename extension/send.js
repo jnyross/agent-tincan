@@ -30,9 +30,10 @@
 // tab stays open until then because closing it may stop claude.ai from
 // finishing the reply. A tab nobody closes is looked at every keepMs: it
 // stays while the page still shows the answer being written (a ChatGPT
-// Pro answer can take hours), and is closed once it does not, or at
-// keepMaxMs whatever the page shows. A send that fails closes its tab at
-// once.
+// Pro answer can take hours), and is closed once it does not (or, only when
+// a keepMaxMs is given, at that cap). While a kept tab is open, tabState
+// reports what its page shows (open, writing, answer length), which the Go
+// side's stuck check reads. A send that fails closes its tab at once.
 //
 // An OpenAI dot's DM is the one exception to step 3: its address never
 // changes, so the send is confirmed by the room feed instead. The DM lives
@@ -67,10 +68,9 @@ export const SEND_TIMEOUT_MS = 5 * 60 * 1000;
 export const ID_WAIT_MS = 60 * 1000;
 // KEEP_TAB_MS is how long a finished send's tab may stay open waiting for
 // its close operation before the page is looked at; while it shows the
-// answer still being written it gets KEEP_TAB_MS more, up to KEEP_TAB_MAX_MS
-// from the send (the Go side's longest request timeout, 24 hours).
+// answer still being written it gets KEEP_TAB_MS more, with no cap by
+// default (a createSender keepMaxMs sets one).
 export const KEEP_TAB_MS = 10 * 60 * 1000;
-export const KEEP_TAB_MAX_MS = 24 * 60 * 60 * 1000;
 // READ_TIMEOUT_MS bounds one Copilot tab read from when it is queued
 // (waiting, load and scrolling included), under the Go client's 100 second
 // wait for it (TabReadClientTimeout); READ_GAP_MS is the least time between
@@ -337,6 +337,8 @@ export function pageProbe(sel) {
     composerEmpty: draft.trim() === '',
     generating: Boolean(q(sel.stop)) || Boolean(q(sel.streaming)),
     assistantCount: qa(sel.assistant).length,
+    // The last answer's text length: it grows while the answer is written.
+    assistantChars: textOf(qa(sel.assistant).at(-1)).length,
     userCount: qa(sel.user).length,
     // MAX_NOTICE, written out: a page function closes over nothing.
     notice: notice.join('\n').slice(0, 500),
@@ -658,6 +660,7 @@ function cleanProbe(r) {
     composerEmpty: o.composerEmpty === true,
     generating: o.generating === true,
     assistantCount: Number.isSafeInteger(o.assistantCount) ? o.assistantCount : 0,
+    assistantChars: Number.isSafeInteger(o.assistantChars) && o.assistantChars >= 0 ? o.assistantChars : 0,
     userCount: Number.isSafeInteger(o.userCount) ? o.userCount : 0,
     notice: str(o.notice, MAX_NOTICE),
   };
@@ -726,7 +729,7 @@ export function createSender({
   sendConfirmMs = 15000,
   idWaitMs = ID_WAIT_MS,
   keepMs = KEEP_TAB_MS,
-  keepMaxMs = KEEP_TAB_MAX_MS,
+  keepMaxMs = Infinity,
   settleMs = 1500,
   readMs = READ_TIMEOUT_MS,
   readGapMs = READ_GAP_MS,
@@ -780,8 +783,8 @@ export function createSender({
   // keep holds a finished send's tab for its close operation. Every keepMs
   // the page is probed (read only): while it still shows the answer being
   // written the tab is kept, since closing it may stop the answer; once it
-  // does not, or the probe fails, or keepMaxMs has passed since the send,
-  // the tab is closed.
+  // does not, or the probe fails, or a keepMaxMs given has passed since the
+  // send, the tab is closed.
   function keep(tabId, site, id) {
     const since = now();
     const arm = () => {
@@ -808,6 +811,29 @@ export function createSender({
       return cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true)).generating;
     } catch {
       return false;
+    }
+  }
+
+  // tabState reports the kept tab of a finished send to conversationId:
+  // {open, generating, assistant_chars} from the read-only page probe. No
+  // such tab, or one that cannot be probed (closed, or sent off the site),
+  // is {open: false}; a tab that cannot be probed is forgotten and closed.
+  async function tabState(site, conversationId) {
+    const entry = [...kept].find(([, k]) => k.site === site && k.id === conversationId);
+    if (!entry) return { open: false, generating: false, assistant_chars: 0 };
+    const [tabId, k] = entry;
+    try {
+      const t = await tabURL(tabId);
+      if (awayError(t, SITES[site])) throw new Error('away');
+      const p = cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true));
+      return { open: true, generating: p.generating, assistant_chars: p.assistantChars };
+    } catch {
+      if (kept.get(tabId) === k) {
+        kept.delete(tabId);
+        clearTimer(k.timer);
+        await removeTab(tabId);
+      }
+      return { open: false, generating: false, assistant_chars: 0 };
     }
   }
 
@@ -1239,6 +1265,11 @@ export function createSender({
     // and only those. It reports how many it closed.
     async close(site, conversationId) {
       return closeKept((k) => k.site === site && k.id === conversationId);
+    },
+    // tabState reports the tab a finished send to conversationId left open
+    // (see tabState above). It reads the page only.
+    tabState(site, conversationId) {
+      return tabState(site, conversationId);
     },
     // capture fetches an image from inside the tab a finished send to
     // conversationId left open (pageFetchImage), for the image host that

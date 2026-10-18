@@ -36,7 +36,8 @@ const SESSION = 'https://chatgpt.com/api/auth/session';
 const TOKEN = 'secret-access-token-never-returned';
 
 test('validate accepts only the fixed operation set with exact args', () => {
-  assert.deepEqual([...OPS].sort(), ['chatgpt.close', 'chatgpt.detail', 'chatgpt.file', 'chatgpt.list', 'chatgpt.send', 'claudeai.close', 'claudeai.detail', 'claudeai.file', 'claudeai.list', 'claudeai.send', 'copilot.close', 'copilot.detail', 'copilot.list', 'copilot.send', 'dots.close', 'dots.detail', 'dots.primary', 'dots.send', 'extension.reload', 'gemini.close', 'gemini.detail', 'gemini.file', 'gemini.list', 'gemini.send', 'grok.close', 'grok.detail', 'grok.file', 'grok.list', 'grok.send', 'perplexity.close', 'perplexity.detail', 'perplexity.send', 'chatgpt.input_abort', 'chatgpt.input_begin', 'chatgpt.input_chunk', 'chatgpt.send_images', ...['chatgpt', 'claudeai', 'grok', 'gemini', 'perplexity', 'copilot', 'dots'].map(site => site + '.session')].sort());
+  assert.deepEqual([...OPS].sort(), ['chatgpt.close', 'chatgpt.detail', 'chatgpt.file', 'chatgpt.list', 'chatgpt.send', 'claudeai.close', 'claudeai.detail', 'claudeai.file', 'claudeai.list', 'claudeai.send', 'copilot.close', 'copilot.detail', 'copilot.list', 'copilot.send', 'dots.close', 'dots.detail', 'dots.primary', 'dots.send', 'extension.reload', 'gemini.close', 'gemini.detail', 'gemini.file', 'gemini.list', 'gemini.send', 'grok.close', 'grok.detail', 'grok.file', 'grok.list', 'grok.send', 'perplexity.close', 'perplexity.detail', 'perplexity.send', 'chatgpt.input_abort', 'chatgpt.input_begin', 'chatgpt.input_chunk', 'chatgpt.send_images', ...['chatgpt', 'claudeai', 'grok', 'gemini', 'perplexity', 'copilot', 'dots'].flatMap(site => [site + '.session', site + '.tab'])].sort());
+  assert.deepEqual(validate({ id: 7, op: 'chatgpt.tab', args: { conversation_id: 'abc-1' } }).args, { conversation_id: 'abc-1' });
   assert.deepEqual(validate({ id: 8, op: 'grok.file', args: { file_id: 'r1_0', conversation_id: 'c1' } }).args, { file_id: 'r1_0', conversation_id: 'c1' });
   assert.deepEqual(validate({ id: 9, op: 'grok.send', args: { message: 'hi', conversation_id: '0e1d0000-0000-4000-8000-000000000001' } }).args.conversation_id, '0e1d0000-0000-4000-8000-000000000001');
   assert.deepEqual(validate({ id: 1, op: 'chatgpt.list', args: { count: 5 } }), { id: 1, op: 'chatgpt.list', args: { count: 5 } });
@@ -65,6 +66,9 @@ test('validate accepts only the fixed operation set with exact args', () => {
     { id: 1, op: 'chatgpt.detail', args: { id: 'x'.repeat(129) } },
     { id: 1, op: 'claudeai.file', args: { file_id: 'f1', conversation_id: 'c1' } },
     { id: 1, op: 'claudeai.detail', args: {} },
+    { id: 1, op: 'chatgpt.tab', args: {} },
+    { id: 1, op: 'chatgpt.tab', args: { conversation_id: '../c/x' } },
+    { id: 1, op: 'chatgpt.tab', args: { conversation_id: 'abc-1', message: 'hi' } },
     { id: 1, op: 'chatgpt.list' },
     { id: 1, op: 'chatgpt.list', args: { count: 1 }, extra: true },
     { id: 1, op: 'chatgpt.send', args: {} },
@@ -445,6 +449,7 @@ test('an op for a site without its grant fails permission_missing and opens no t
   const sender = {
     send: async (site, a) => (sent.push(site), { conversation_id: 'c1', url: '', submitted_at: 1 }),
     close: async (site, id) => (closed.push([site, id]), { closed: 1 }),
+    tabState: async (site, id) => ({ open: true, generating: true, assistant_chars: 3, site, id }),
   };
   const perms = fakePermissions(['https://claude.ai/*']);
   const r = createRunner({ fetch: f, sender, permissions: perms });
@@ -459,6 +464,8 @@ test('an op for a site without its grant fails permission_missing and opens no t
   // revoked while a reply is read still lets its tab close.
   assert.deepEqual(await run(r, 'chatgpt.close', { conversation_id: 'c1' }), [{ ok: true, result: { closed: 1 } }]);
   assert.deepEqual(closed, [['chatgpt', 'c1']]);
+  // Reading that tab's state reaches no site either.
+  assert.deepEqual(await run(r, 'chatgpt.tab', { conversation_id: 'c1' }), [{ ok: true, result: { open: true, generating: true, assistant_chars: 3, site: 'chatgpt', id: 'c1' } }]);
   assert.deepEqual(perms.asked[0], [...SITE_ACCESS.chatgpt.pageOrigins]);
 
   // Granted: the op runs.

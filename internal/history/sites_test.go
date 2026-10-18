@@ -16,7 +16,7 @@ import (
 func TestOpsResolveToTheirOwnSite(t *testing.T) {
 	cases := map[Op]Source{
 		OpChatGPTList: SourceChatGPT, OpChatGPTDetail: SourceChatGPT, OpChatGPTFile: SourceChatGPT,
-		OpChatGPTSend: SourceChatGPT, OpChatGPTClose: SourceChatGPT,
+		OpChatGPTSend: SourceChatGPT, OpChatGPTClose: SourceChatGPT, OpChatGPTTab: SourceChatGPT,
 		OpClaudeAIList: SourceClaudeAI, OpClaudeAIDetail: SourceClaudeAI, OpClaudeAIFile: SourceClaudeAI,
 		OpClaudeAISend: SourceClaudeAI, OpClaudeAIClose: SourceClaudeAI,
 		OpGrokList: SourceGrok, OpGrokDetail: SourceGrok, OpGrokFile: SourceGrok,

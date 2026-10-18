@@ -197,6 +197,8 @@ const DOT_THREAD_RE = /^[0-9A-Fa-f-]{8,64}$/;
 // 'message' a required non-blank string of at most MAX_MESSAGE_BYTES.
 const SEND_SPEC = Object.freeze({ message: 'message', conversation_id: 'id?', new_chat: 'bool?' });
 const CLOSE_SPEC = Object.freeze({ conversation_id: 'id' });
+// A <site>.tab operation reads the tab a send left open (sender.tabState).
+const TAB_SPEC = CLOSE_SPEC;
 const SPEC = Object.freeze({
   ...Object.fromEntries(['chatgpt', 'claudeai', 'grok', 'gemini', 'perplexity', 'copilot', 'dots'].map(site => [site + '.session', Object.freeze({})])),
   'chatgpt.list': Object.freeze({ count: 'count' }),
@@ -230,6 +232,7 @@ const SPEC = Object.freeze({
   'dots.primary': Object.freeze({}),
   'dots.send': SEND_SPEC,
   'dots.close': CLOSE_SPEC,
+  ...Object.fromEntries(['chatgpt', 'claudeai', 'grok', 'gemini', 'perplexity', 'copilot', 'dots'].map(site => [site + '.tab', TAB_SPEC])),
   'extension.reload': Object.freeze({}),
 });
 
@@ -1489,6 +1492,12 @@ export function createRunner({ fetch, sender = null, reload = null, permissions 
       if (!sender) throw new OpError('unsupported', 'this extension build cannot send');
       return sender.close('dots', a.conversation_id);
     },
+    // tab reads the page of a tab a send opened and left open; it types
+    // and clicks nothing.
+    ...Object.fromEntries(['chatgpt', 'claudeai', 'grok', 'gemini', 'perplexity', 'copilot', 'dots'].map(site => [site + '.tab', async (a) => {
+      if (!sender) throw new OpError('unsupported', 'this extension build cannot send');
+      return sender.tabState(site, a.conversation_id);
+    }])),
     // The answer goes out first; the reload follows a moment later, or
     // once no send has a tab open (see RELOAD_MAX_WAIT_MS).
     async 'extension.reload'(_a, emit) {
@@ -1501,13 +1510,13 @@ export function createRunner({ fetch, sender = null, reload = null, permissions 
 
   // requireGrant fails permission_missing when op's site's page origins
   // are not granted.
-  // Closing a tab the extension opened reaches no site, so it runs
-  // regardless: a grant revoked while a reply is read still lets the tab
+  // Closing a tab the extension opened, or reading its state, reaches no
+  // site, so it runs regardless: a grant revoked while a reply is read still lets the tab
   // close.
   async function requireGrant(op) {
     const [prefix, verb] = op.split('.');
     const site = Object.hasOwn(SITE_ALIASES, prefix) ? SITE_ALIASES[prefix] : prefix;
-    if (!permissions || !Object.hasOwn(SITE_ACCESS, site) || verb === 'close') return;
+    if (!permissions || !Object.hasOwn(SITE_ACCESS, site) || verb === 'close' || verb === 'tab') return;
     if (!(await siteGranted(permissions, site))) {
       throw new OpError('permission_missing', `the extension has no access to ${SITE_ACCESS[site].label}; grant it on the extension's options page`);
     }

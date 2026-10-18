@@ -510,6 +510,60 @@ test('a kept tab still writing at keepMaxMs is closed anyway, and close still cl
   assert.equal(timers.pending().length, 0);
 });
 
+test('with no keepMaxMs a kept tab still writing is never closed by the timer, however long (30 hours)', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, now: () => fc.now() + later });
+  await s.send('chatgpt', { message: 'a very long one', new_chat: true });
+  for (let i = 0; i < 180; i++) {
+    later += 10 * 60 * 1000;
+    await fire(timers);
+  }
+  assert.deepEqual(fc.log.removed, [], 'the tab was closed while the answer was still being written');
+  assert.equal(page.generating, true);
+  assert.equal(timers.pending().length, 1);
+});
+
+// tabState is what the Go side's stuck check reads: the kept tab's page,
+// read only, never typed into.
+test('tabState reports a kept tab: open and writing, its answer growing, then gone', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const timers = fakeTimers();
+  const s = sender(fc, { timers });
+  const r = await s.send('chatgpt', { message: 'think', new_chat: true });
+  const a = await s.tabState('chatgpt', r.conversation_id);
+  assert.equal(a.open, true);
+  assert.equal(a.generating, true);
+  page.tick();
+  const b = await s.tabState('chatgpt', r.conversation_id);
+  assert.ok(b.assistant_chars > a.assistant_chars, `answer length ${a.assistant_chars} -> ${b.assistant_chars}`);
+  page.generating = false;
+  const c = await s.tabState('chatgpt', r.conversation_id);
+  assert.deepEqual([c.open, c.generating, c.assistant_chars], [true, false, b.assistant_chars]);
+  assert.deepEqual(page.submitted, ['think'], 'tabState typed into the page');
+  assert.deepEqual(await s.tabState('chatgpt', 'some-other-conversation'), { open: false, generating: false, assistant_chars: 0 });
+  assert.deepEqual(await s.tabState('claudeai', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  // The tab closed under it (the owner closed it): not open, and forgotten.
+  await fc.chrome.tabs.remove(100);
+  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  assert.equal(timers.pending().length, 0);
+  assert.equal(s.busy(), false);
+  assertOnlyFixedScripts(fc.log);
+});
+
+test('tabState of a kept tab the site sent to another host is not open, and the tab is closed', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const s = sender(fc);
+  const r = await s.send('chatgpt', { message: 'x', new_chat: true });
+  page.href = 'https://auth.openai.com/log-in';
+  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  assert.deepEqual(fc.log.removed, [100]);
+});
+
 test('a kept tab that can no longer be probed is closed at keepMs', async () => {
   const fc = fakeChrome((url) => new FakeSite('chatgpt', url, { neverFinish: true }));
   const timers = fakeTimers();

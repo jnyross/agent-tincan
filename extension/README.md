@@ -15,8 +15,15 @@ injected with `chrome.scripting` (message as an argument, isolated world),
 click send, and return once the conversation id is in the tab's address. They
 never watch the page for the answer: the Go side reads the conversation until
 the answer is finished, then calls `chatgpt.close`, `claudeai.close`, `grok.close`, `gemini.close`, `perplexity.close` or `copilot.close`, which
-close only the tab a send left open for that conversation (any such tab is
-closed after 10 minutes regardless). A send tab the site moves to another
+close only the tab a send left open for that conversation. A tab nobody
+closes is probed every 10 minutes and kept while its page still shows the
+answer being written, then closed. While a kept tab is open,
+`chatgpt.tab {conversation_id}` (and `claudeai.tab`, `grok.tab`,
+`gemini.tab`, `perplexity.tab`, `copilot.tab`, `dots.tab`) reports it with
+the same read-only page probe: `{open, generating, assistant_chars}`, the
+last answer's text length as a number, never the text. It types and clicks
+nothing, reaches no site and needs no grant; the Go side's stuck check reads
+it for a request with no deadline. A send tab the site moves to another
 host is never typed into: Google's `/sorry/` page is `blocked`, any other host
 (a sign-in page) `not_logged_in`.
 All page selectors are in the `SELECTORS` table in `send.js`; see
@@ -56,7 +63,7 @@ page's main world.
 
 `SITE_ACCESS` in `ops.js` lists each site's origins, keyed by its op prefix,
 and among them its page origins (`pageOrigins`). Before any operation except
-close, the worker asks `chrome.permissions.contains` for the site's page
+close and tab, the worker asks `chrome.permissions.contains` for the site's page
 origins and fails with `permission_missing` (no tab, no fetch) when they are
 not granted. The other origins (ChatGPT's `*.oaiusercontent.com` file host)
 are not checked up front: withholding one leaves list and read working, and
