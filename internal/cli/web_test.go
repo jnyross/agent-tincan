@@ -443,34 +443,39 @@ func TestWebServeDotsNeedsDotWebKind(t *testing.T) {
 	}
 }
 
-// web serve's request timeout: --request-timeout, else
-// $TINCAN_WEB_REQUEST_TIMEOUT, else zero (the site's own default); either
-// must be above zero and at most history.MaxWebRequestTimeout.
+// web serve's request deadline: --request-timeout, else
+// $TINCAN_WEB_REQUEST_TIMEOUT. A positive duration is a deadline, 0 (or
+// none in the variable) no deadline on any site, unset each site's default.
+// Nothing caps it.
 func TestWebRequestTimeoutFlagAndEnv(t *testing.T) {
 	for _, c := range []struct {
 		flag    time.Duration
 		set     bool
 		env     string
 		want    time.Duration
+		none    bool
 		wantErr string
 	}{
 		{want: 0},
 		{env: "6h", want: 6 * time.Hour},
+		{env: "none", none: true},
+		{env: "0", none: true},
 		{flag: 90 * time.Minute, set: true, env: "6h", want: 90 * time.Minute},
-		{flag: 0, set: true, wantErr: "--request-timeout must be above 0"},
-		{flag: 25 * time.Hour, set: true, wantErr: "at most 24h0m0s"},
+		{flag: 0, set: true, env: "6h", none: true},
+		{flag: 72 * time.Hour, set: true, want: 72 * time.Hour},
+		{flag: -time.Minute, set: true, wantErr: "--request-timeout must not be negative"},
 		{env: "soon", wantErr: "TINCAN_WEB_REQUEST_TIMEOUT=\"soon\" is not a duration"},
-		{env: "-1m", wantErr: "TINCAN_WEB_REQUEST_TIMEOUT must be above 0"},
+		{env: "-1m", wantErr: "TINCAN_WEB_REQUEST_TIMEOUT must not be negative"},
 	} {
-		got, err := webRequestTimeout(c.flag, c.set, c.env)
+		got, none, err := webRequestTimeout(c.flag, c.set, c.env)
 		if c.wantErr != "" {
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 				t.Errorf("%+v: err %v, want %q", c, err, c.wantErr)
 			}
 			continue
 		}
-		if err != nil || got != c.want {
-			t.Errorf("%+v: %s %v, want %s", c, got, err, c.want)
+		if err != nil || got != c.want || none != c.none {
+			t.Errorf("%+v: %s %t %v, want %s %t", c, got, none, err, c.want, c.none)
 		}
 	}
 }
@@ -479,11 +484,11 @@ func TestWebRequestTimeoutFlagAndEnv(t *testing.T) {
 func TestWebServeRejectsBadRequestTimeout(t *testing.T) {
 	t.Setenv(webRequestTimeoutEnv, "")
 	cmd := webServeCmd()
-	cmd.SetArgs([]string{"--site", "chatgpt", "--request-timeout", "48h", "--config", filepath.Join(t.TempDir(), "missing.json")})
+	cmd.SetArgs([]string{"--site", "chatgpt", "--request-timeout", "-5m", "--config", filepath.Join(t.TempDir(), "missing.json")})
 	cmd.SetOut(io.Discard)
 	cmd.SetErr(io.Discard)
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "--request-timeout must be above 0 and at most 24h0m0s, got 48h0m0s") {
+	if err == nil || !strings.Contains(err.Error(), "--request-timeout must not be negative (0 means no deadline), got -5m0s") {
 		t.Fatalf("err %v", err)
 	}
 }

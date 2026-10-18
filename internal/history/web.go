@@ -27,18 +27,16 @@ import (
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
-// DefaultWebRequestTimeout bounds one web agent request on a site with no
-// request timeout of its own: the send, the wait for the reply to finish,
-// and the reads after it.
+// DefaultWebRequestTimeout bounds one web agent request on a site that
+// has a deadline (every site but ChatGPT): the send, the wait for the reply
+// to finish, and the reads after it.
 const DefaultWebRequestTimeout = 8 * time.Minute
 
-// DefaultChatGPTRequestTimeout is ChatGPT's request timeout: a Pro or deep
-// research answer can take well over an hour.
-const DefaultChatGPTRequestTimeout = 4 * time.Hour
-
-// MaxWebRequestTimeout caps every request timeout, configured or asked
-// for with a timeout: line: the relay's default request lifetime.
-const MaxWebRequestTimeout = 24 * time.Hour
+// answerStaleAfter is how old a conversation's unfinished answer may be and
+// still refuse a send into it (stillAnswering): an answer the site left
+// unfinished longer ago than this is taken as abandoned, not as one still
+// being written. It bounds no request.
+const answerStaleAfter = 24 * time.Hour
 
 // webClockSkew is how much earlier than the extension's submitted_at the
 // site may date the new message and still have it count as this send's.
@@ -133,10 +131,20 @@ type WebAgent struct {
 	// empty).
 	TempDir string
 	Hold    time.Duration
-	// RequestTimeout bounds one request (the site's own timeout, else
-	// DefaultWebRequestTimeout, when zero; at most MaxWebRequestTimeout).
-	// A request's own timeout: line replaces it.
+	// RequestTimeout, when above zero, bounds every request. When zero the
+	// site's default holds: no deadline on ChatGPT (the request ends when
+	// its answer is finished, the wait fails for good, or the stuck check
+	// finds the tab and conversation dead), DefaultWebRequestTimeout on the
+	// others. A request's own timeout: line sets its deadline.
 	RequestTimeout time.Duration
+	// NoDeadline takes the deadline off every request without a timeout:
+	// line, on any site (web serve --request-timeout 0).
+	NoDeadline bool
+	// StuckChecks is how many reads in a row, on a request with no
+	// deadline, may show no sign of the answer being written before the
+	// request ends as stuck (DefaultWebStuckChecks when zero; see
+	// stuckWatch).
+	StuckChecks int
 	// LeaseRenew is how often the agent posts a progress note while it
 	// waits for a reply, which renews its claim so the relay never
 	// requeues a request whose answer is still being written
@@ -231,7 +239,10 @@ func (w *WebAgent) PollOnce(ctx context.Context) (int, error) {
 }
 
 func (w *WebAgent) handleSafely(ctx context.Context, req envelope.Request) {
-	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.timeoutFor(req))
+	hctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if d, ok := w.timeoutFor(req); ok {
+		hctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), d)
+	}
 	defer cancel()
 	defer w.keepPresence(hctx)()
 	defer func() {
@@ -243,29 +254,29 @@ func (w *WebAgent) handleSafely(ctx context.Context, req envelope.Request) {
 	w.Handle(hctx, req)
 }
 
-// requestTimeout is the bound on one request: RequestTimeout, else the
-// site's own, else DefaultWebRequestTimeout, never over
-// MaxWebRequestTimeout.
-func (w *WebAgent) requestTimeout() time.Duration {
-	d := w.RequestTimeout
-	if d <= 0 {
-		if s := siteFor(w.Site); s != nil {
-			d = s.requestTimeout
-		}
+// requestTimeout is the agent's deadline on one request and whether there
+// is one: RequestTimeout when set, none with NoDeadline or on a site
+// without one (ChatGPT), else DefaultWebRequestTimeout.
+func (w *WebAgent) requestTimeout() (time.Duration, bool) {
+	switch {
+	case w.RequestTimeout > 0:
+		return w.RequestTimeout, true
+	case w.NoDeadline:
+		return 0, false
 	}
-	if d <= 0 {
-		d = DefaultWebRequestTimeout
+	if s := siteFor(w.Site); s != nil && s.noDeadline {
+		return 0, false
 	}
-	return min(d, MaxWebRequestTimeout)
+	return DefaultWebRequestTimeout, true
 }
 
-// timeoutFor is req's bound: its own timeout: line when it has one, else
-// requestTimeout. A one-thread site (a dot) sends the body as is, so a
-// timeout: line there is text.
-func (w *WebAgent) timeoutFor(req envelope.Request) time.Duration {
+// timeoutFor is req's deadline and whether it has one: its own timeout:
+// line when it has one, else requestTimeout. A one-thread site (a dot)
+// sends the body as is, so a timeout: line there is text.
+func (w *WebAgent) timeoutFor(req envelope.Request) (time.Duration, bool) {
 	if s := siteFor(w.Site); s != nil && !s.oneThread {
 		if wr, err := parseWebRequest(req.Body); err == nil && wr.timeout > 0 {
-			return wr.timeout
+			return wr.timeout, true
 		}
 	}
 	return w.requestTimeout()
@@ -290,8 +301,8 @@ type webRequest struct {
 	mode    webThread
 	convID  string
 	message string
-	// timeout is the request's own bound from a timeout: line (zero when
-	// it has none), at most MaxWebRequestTimeout.
+	// timeout is the request's own deadline from a timeout: line (zero
+	// when it has none).
 	timeout time.Duration
 }
 
@@ -304,8 +315,8 @@ const NewChat = "new chat"
 const threadingHelp = `Put "new chat" or "conversation: <id>" on the first line to choose the conversation, and the message after it.`
 
 // timeoutLine reads a leading "timeout: <duration>" line (a Go duration
-// such as 90m or 6h, above zero): the duration, capped at
-// MaxWebRequestTimeout, and the body after the line. Any other first line,
+// such as 90m or 6h, above zero): the duration and the body after the
+// line. Any other first line,
 // including a timeout: line whose value is not such a duration, is not
 // one, and the body is returned as is.
 func timeoutLine(body string) (time.Duration, string, bool) {
@@ -318,7 +329,7 @@ func timeoutLine(body string) (time.Duration, string, bool) {
 	if err != nil || d <= 0 {
 		return 0, body, false
 	}
-	return min(d, MaxWebRequestTimeout), rest, true
+	return d, rest, true
 }
 
 // parseWebRequest reads the optional leading lines: the threading line,
@@ -748,6 +759,16 @@ func (w *WebAgent) resume(ctx context.Context, req envelope.Request, wr webReque
 func (w *WebAgent) answer(ctx context.Context, req envelope.Request, anchor replyAnchor, e webSend, note string) {
 	label := siteLabel(w.Site)
 	convID := e.ConversationID
+	if k := claimKeeperFrom(ctx); k != nil {
+		// Each claim renewal touches the journal entry, so a wait of any
+		// length keeps it: a requeued request finds it and is not sent
+		// again.
+		k.onRenew = func(now time.Time) {
+			e.Touched = now.UTC()
+			w.journal(req.ID, e)
+		}
+		defer func() { k.onRenew = nil }()
+	}
 	raw, userID, err := w.waitReply(ctx, convID, anchor, func(id string) {
 		e.UserMessageID = id
 		w.journal(req.ID, e)
@@ -1008,6 +1029,12 @@ func (w *WebAgent) waitFailure(err error, convID string) string {
 	}
 	if errors.As(err, &ue) && !errors.Is(err, ErrTimeout) {
 		return fmt.Sprintf("Sorry, %s. The message was sent to %s (conversation %s), but the reply could not be read.", ue.Error(), label, convID)
+	}
+	switch {
+	case errors.Is(err, errStuck):
+		return fmt.Sprintf("Sorry, %s stopped writing its answer: the tab it was written in is gone or no longer shows it being written, and the conversation has not changed since. The message was sent to %s (conversation %s); open the conversation to see where it stopped, and ask for the reply later instead of sending it again.", label, label, convID)
+	case errors.Is(err, errConversationGone):
+		return fmt.Sprintf("Sorry, the %s conversation %s is gone (deleted, or no longer readable), so its answer cannot be read. The message was sent.", label, convID)
 	}
 	if w.oneThread() {
 		return fmt.Sprintf("Sorry, %s did not answer in time. The message was sent to %s (conversation %s); ask for the reply later instead of sending it again.", label, label, convID)
@@ -1328,12 +1355,12 @@ var errStillAnswering = errors.New("the conversation is still answering an earli
 // stillAnswering reports whether the turn of the conversation's last user
 // message u, judged as p, is an answer the site has not finished. A turn
 // with no answer yet is not (it may never get one), nor is one older than
-// MaxWebRequestTimeout, which no request is still waiting on.
+// answerStaleAfter.
 func stillAnswering(u webNode, p replyProgress, now time.Time) bool {
 	if !p.found || p.finished {
 		return false
 	}
-	return u.at.IsZero() || now.Sub(u.at) < MaxWebRequestTimeout
+	return u.at.IsZero() || now.Sub(u.at) < answerStaleAfter
 }
 
 // webReply is the answer read from the finished conversation: its text,

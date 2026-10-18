@@ -8,14 +8,15 @@ import (
 	"time"
 )
 
-// DefaultWebJournalRetention is how long a send journal entry is kept: as
-// long as any request can still be waiting for its reply (the longest
-// request timeout), plus the relay's 30-minute claim lease (after which it
-// requeues a claim that went quiet, as when the agent crashed) and a
-// margin for a second requeue. An entry pruned while its request could
-// still come back would let the request be typed into its conversation a
-// second time.
-const DefaultWebJournalRetention = MaxWebRequestTimeout + 30*time.Minute + time.Hour
+// DefaultWebJournalRetention is how long a send journal entry is kept after
+// it was last written or touched: the relay's default request lifetime
+// (24 hours; a request the relay requeues after that has expired instead),
+// plus its 30-minute claim lease (after which it requeues a claim that went
+// quiet, as when the agent crashed) and a margin for a second requeue. A
+// wait touches its entry at every claim renewal, so a wait of any length
+// keeps it. An entry pruned while its request could still come back would
+// let the request be typed into its conversation a second time.
+const DefaultWebJournalRetention = 24*time.Hour + 30*time.Minute + time.Hour
 
 // webJournal is the send journal: request id -> what was sent for it. It
 // holds ids and times only, never messages or replies. A requeued request
@@ -39,8 +40,10 @@ type webSend struct {
 	// PrevUserID is the conversation's last user message before the send.
 	PrevUserID  string    `json:"prev_user_id,omitempty"`
 	SubmittedAt time.Time `json:"submitted_at,omitzero"`
-	// Recorded is when the entry was first written; pruning goes by it.
+	// Recorded is when the entry was first written; Touched, when later,
+	// is when the wait last renewed its claim. Pruning goes by the later.
 	Recorded time.Time `json:"recorded"`
+	Touched  time.Time `json:"touched,omitzero"`
 	// State is sent, or answered once the reply was built and sent.
 	State string `json:"state"`
 }
@@ -78,7 +81,7 @@ func (w *WebAgent) loadJournal() webJournal {
 		if e.State == webSendIntent || (e.Input && e.State != webSendAnswered) {
 			continue
 		}
-		if e.Recorded.Before(cutoff) || !validNativeID(e.ConversationID) || (e.UserMessageID != "" && !validNativeID(e.UserMessageID)) {
+		if e.Recorded.Before(cutoff) && e.Touched.Before(cutoff) || !validNativeID(e.ConversationID) || (e.UserMessageID != "" && !validNativeID(e.UserMessageID)) {
 			delete(j.Requests, id)
 		}
 	}

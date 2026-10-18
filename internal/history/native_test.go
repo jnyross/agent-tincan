@@ -88,6 +88,8 @@ func TestValidateOp(t *testing.T) {
 		{OpClaudeAISend, OpArgs{Message: strings.Repeat("x", MaxSendMessage), ConversationID: "c1a0d000-0000-4000-8000-000000000001"}},
 		{OpChatGPTClose, OpArgs{ConversationID: "6a1f0c2e-1111-4a2b-9c3d-000000000001"}},
 		{OpClaudeAIClose, OpArgs{ConversationID: "c1a0d000-0000-4000-8000-000000000001"}},
+		{OpChatGPTTab, OpArgs{ConversationID: "6a1f0c2e-1111-4a2b-9c3d-000000000001"}},
+		{"dots.tab", OpArgs{ConversationID: "abc-1"}},
 		{OpExtensionReload, OpArgs{}},
 	}
 	for _, c := range ok {
@@ -124,6 +126,9 @@ func TestValidateOp(t *testing.T) {
 		{OpClaudeAISend, OpArgs{Message: "hi", Count: 1}},
 		{OpChatGPTClose, OpArgs{}},
 		{OpChatGPTClose, OpArgs{ConversationID: "../c/x"}},
+		{OpChatGPTTab, OpArgs{}},
+		{OpChatGPTTab, OpArgs{ConversationID: "../c/x"}},
+		{OpChatGPTTab, OpArgs{ConversationID: "abc", Message: "hi"}},
 		{OpClaudeAIClose, OpArgs{ConversationID: "abc", ID: "abc"}},
 		{OpClaudeAIClose, OpArgs{ConversationID: "abc", Message: "hi"}},
 		{OpExtensionReload, OpArgs{Count: 1}},

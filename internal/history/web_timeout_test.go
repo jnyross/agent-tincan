@@ -2,6 +2,7 @@ package history
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -10,52 +11,56 @@ import (
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
-// Limit (a): a web agent's request timeout is the site's own unless set,
-// ChatGPT's is hours, a request can name its own with a timeout: line, and
-// none goes over MaxWebRequestTimeout.
+// Limit (a): ChatGPT has no deadline by default, the other sites keep 8
+// minutes, web serve can set or remove one, a request can name its own
+// with a timeout: line, and nothing caps a deadline.
 func TestWebRequestTimeoutPerSiteAndPerAsk(t *testing.T) {
-	agent := func(site Source, set time.Duration) *WebAgent {
-		return &WebAgent{Site: site, RequestTimeout: set}
+	type want struct {
+		d  time.Duration
+		ok bool
 	}
 	for _, c := range []struct {
 		site Source
 		set  time.Duration
-		want time.Duration
+		none bool
+		want want
 	}{
-		{SourceChatGPT, 0, DefaultChatGPTRequestTimeout},
-		{SourceClaudeAI, 0, DefaultWebRequestTimeout},
-		{SourceGemini, 0, DefaultWebRequestTimeout},
-		{SourceDots, 0, DefaultWebRequestTimeout},
-		{SourceChatGPT, 90 * time.Minute, 90 * time.Minute},
-		{SourceClaudeAI, 2 * time.Hour, 2 * time.Hour},
-		{SourceChatGPT, 48 * time.Hour, MaxWebRequestTimeout},
+		{SourceChatGPT, 0, false, want{0, false}},
+		{SourceClaudeAI, 0, false, want{DefaultWebRequestTimeout, true}},
+		{SourceGemini, 0, false, want{DefaultWebRequestTimeout, true}},
+		{SourceDots, 0, false, want{DefaultWebRequestTimeout, true}},
+		{SourceChatGPT, 90 * time.Minute, false, want{90 * time.Minute, true}},
+		{SourceClaudeAI, 2 * time.Hour, false, want{2 * time.Hour, true}},
+		{SourceClaudeAI, 0, true, want{0, false}},
+		{SourceChatGPT, 72 * time.Hour, false, want{72 * time.Hour, true}},
 	} {
-		if got := agent(c.site, c.set).requestTimeout(); got != c.want {
-			t.Errorf("%s with %s: %s, want %s", c.site, c.set, got, c.want)
+		d, ok := (&WebAgent{Site: c.site, RequestTimeout: c.set, NoDeadline: c.none}).requestTimeout()
+		if (want{d, ok}) != c.want {
+			t.Errorf("%s set %s none %t: %s %t, want %+v", c.site, c.set, c.none, d, ok, c.want)
 		}
-	}
-	if DefaultChatGPTRequestTimeout < 4*time.Hour {
-		t.Fatalf("ChatGPT's default is %s", DefaultChatGPTRequestTimeout)
 	}
 
 	for _, c := range []struct {
 		site Source
 		body string
-		want time.Duration
+		want want
 	}{
-		{SourceChatGPT, "timeout: 6h\nhello", 6 * time.Hour},
-		{SourceChatGPT, "Timeout: 90m\nnew chat\nhello", 90 * time.Minute},
-		{SourceClaudeAI, "timeout: 1h\nhello", time.Hour},
-		{SourceChatGPT, "timeout: 72h\nhello", MaxWebRequestTimeout},
-		{SourceChatGPT, "timeout: how do I set one in nginx?", DefaultChatGPTRequestTimeout},
-		{SourceChatGPT, "timeout: 0s\nhello", DefaultChatGPTRequestTimeout},
-		{SourceChatGPT, "timeout: -5m\nhello", DefaultChatGPTRequestTimeout},
-		{SourceChatGPT, "hello\ntimeout: 6h", DefaultChatGPTRequestTimeout},
+		{SourceChatGPT, "timeout: 6h\nhello", want{6 * time.Hour, true}},
+		{SourceChatGPT, "Timeout: 90m\nnew chat\nhello", want{90 * time.Minute, true}},
+		{SourceChatGPT, "new chat\ntimeout: 30m\nhello", want{30 * time.Minute, true}},
+		{SourceClaudeAI, "timeout: 1h\nhello", want{time.Hour, true}},
+		{SourceChatGPT, "timeout: 72h\nhello", want{72 * time.Hour, true}},
+		{SourceChatGPT, "timeout: how do I set one in nginx?", want{0, false}},
+		{SourceChatGPT, "timeout: 0s\nhello", want{0, false}},
+		{SourceChatGPT, "timeout: -5m\nhello", want{0, false}},
+		{SourceChatGPT, "hello\ntimeout: 6h", want{0, false}},
+		{SourceClaudeAI, "timeout: soon\nhello", want{DefaultWebRequestTimeout, true}},
 		// A dot's body is sent as is: the line is text there.
-		{SourceDots, "timeout: 6h\nhello", DefaultWebRequestTimeout},
+		{SourceDots, "timeout: 6h\nhello", want{DefaultWebRequestTimeout, true}},
 	} {
-		if got := agent(c.site, 0).timeoutFor(envelope.Request{Body: c.body}); got != c.want {
-			t.Errorf("%s %q: %s, want %s", c.site, c.body, got, c.want)
+		d, ok := (&WebAgent{Site: c.site}).timeoutFor(envelope.Request{Body: c.body})
+		if (want{d, ok}) != c.want {
+			t.Errorf("%s %q: %s %t, want %+v", c.site, c.body, d, ok, c.want)
 		}
 	}
 }
@@ -96,6 +101,7 @@ func TestParseWebRequestTimeoutLine(t *testing.T) {
 func TestWebReplyWaitBudgetFollowsRequestTimeout(t *testing.T) {
 	rig := newWebRig(t)
 	rig.agent.PollInterval = 0
+	rig.agent.RequestTimeout = 3 * time.Hour
 	clock := newFakeClock()
 	rig.agent.clock = clock
 	rig.browser.convs["conv-1"] = []*fakeTurn{{prompt: "hello", reply: "never finished", sentAt: time.Now(), pending: -1}}
@@ -104,8 +110,76 @@ func TestWebReplyWaitBudgetFollowsRequestTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err %v", err)
 	}
-	if got := clock.Now().Sub(start); got < DefaultChatGPTRequestTimeout-time.Minute || got > DefaultChatGPTRequestTimeout {
-		t.Fatalf("the wait gave up after %s, want about %s", got, DefaultChatGPTRequestTimeout)
+	if got := clock.Now().Sub(start); got < 3*time.Hour-time.Minute || got > 3*time.Hour {
+		t.Fatalf("the wait gave up after %s, want about 3h", got)
+	}
+}
+
+// tabChannel answers <site>.tab with state and passes everything else to
+// the fake browser.
+func tabChannel(fb *fakeBrowser, state func() (TabState, *NativeError)) channelFunc {
+	return func(ctx context.Context, req NativeRequest, recv func(NativeResponse) (bool, error)) error {
+		if req.Op != OpChatGPTTab {
+			return fb.Exchange(ctx, req, recv)
+		}
+		st, nerr := state()
+		if nerr != nil {
+			_, err := recv(NativeResponse{ID: req.ID, Error: nerr})
+			return err
+		}
+		b, _ := json.Marshal(st)
+		_, err := recv(NativeResponse{ID: req.ID, OK: true, Result: b})
+		return err
+	}
+}
+
+// The stuck watch, read by read: a changing reply, a page that shows the
+// answer being written or a growing answer text each count as alive and
+// start the count again; StuckChecks reads in a row with none end the wait;
+// so do StuckChecks not-found reads, whatever the tab shows. An extension
+// that cannot report its tab is never taken as stuck.
+func TestWebStuckWatchCountsOnlyReadsWithNoSignOfLife(t *testing.T) {
+	rig := newWebRig(t)
+	rig.agent.StuckChecks = 3
+	var st TabState
+	var nerr *NativeError
+	rig.agent.Native = &Client{Channel: tabChannel(rig.browser, func() (TabState, *NativeError) { return st, nerr })}
+	ctx := t.Context()
+	s := rig.agent.newStuckWatch("conv-1")
+	step := func(sig string, readErr error, wantEnd error) {
+		t.Helper()
+		if got := s.check(ctx, sig, readErr); !errors.Is(got, wantEnd) || (wantEnd == nil && got != nil) {
+			t.Fatalf("sig %q err %v tab %+v: %v, want %v", sig, readErr, st, got, wantEnd)
+		}
+	}
+	st = TabState{Open: true, Generating: true}
+	for range 10 {
+		step("same", nil, nil) // a page writing its answer stays alive however long
+	}
+	st = TabState{Open: true, AssistantChars: 10}
+	step("same", nil, nil) // the answer grew on the page
+	step("same", nil, nil)
+	step("same", nil, nil)
+	step("grew", nil, nil) // the conversation's reply changed
+	st = TabState{}        // the tab is gone
+	step("grew", nil, nil)
+	step("grew", errors.New("flaky read"), nil)
+	step("grew", nil, errStuck)
+
+	s = rig.agent.newStuckWatch("conv-1")
+	st = TabState{Open: true, Generating: true}
+	notFound := unavailable(SourceChatGPT, ErrNotFound, "gone")
+	step("", notFound, nil)
+	step("", notFound, nil)
+	step("", notFound, errConversationGone)
+
+	s = rig.agent.newStuckWatch("conv-1")
+	nerr = &NativeError{Code: "bad_request", Message: "unknown operation"}
+	for range 10 {
+		step("same", nil, nil) // an older extension: no tab state, never stuck
+	}
+	if (*stuckWatch)(nil).check(ctx, "", nil) != nil {
+		t.Fatal("a nil watch ended the wait")
 	}
 }
 

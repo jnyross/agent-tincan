@@ -107,9 +107,12 @@ type webSite struct {
 	// dot's DM), given with --thread. Every request goes there, the
 	// threading first line is sent as text, and each send names it.
 	oneThread bool
-	// requestTimeout, when set, replaces DefaultWebRequestTimeout as the
-	// site's bound on one request (ChatGPT's Pro answers take hours).
-	requestTimeout time.Duration
+	// noDeadline: a request to the site has no deadline by default (a
+	// ChatGPT Pro or deep research answer can take hours). It ends when the
+	// answer is finished, the wait fails for good, or the stuck check finds
+	// the tab and conversation dead; a request's timeout: line, or web
+	// serve --request-timeout, sets one.
+	noDeadline bool
 	// refuseWhileAnswering: the site marks an answer finished reliably,
 	// so a send into a conversation whose latest answer is still being
 	// written is refused before anything is typed (the extension's page
@@ -184,7 +187,7 @@ var webSites = []*webSite{
 		},
 		nodes:                chatgptNodes,
 		convPath:             convURLPattern,
-		requestTimeout:       DefaultChatGPTRequestTimeout,
+		noDeadline:           true,
 		refuseWhileAnswering: true,
 	},
 	{
@@ -347,6 +350,9 @@ const (
 	opFile    opKind = "file"
 	opSend    opKind = "send"
 	opClose   opKind = "close"
+	// opTab reads the state of the tab a send left open for a
+	// conversation (tabState); like close it reaches no site.
+	opTab opKind = "tab"
 	// opPrimary names the account's primary dot (dots.primary), for web
 	// install; only a one-thread site has it.
 	opPrimary opKind = "primary"
@@ -354,7 +360,7 @@ const (
 
 func (k opKind) valid() bool {
 	switch k {
-	case opSession, opList, opDetail, opFile, opSend, opClose, opPrimary:
+	case opSession, opList, opDetail, opFile, opSend, opClose, opTab, opPrimary:
 		return true
 	}
 	return false

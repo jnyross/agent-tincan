@@ -71,6 +71,13 @@ const (
 // (an HTTP 5xx, a flaky read).
 const maxErrorBackoff = 2 * time.Minute
 
+// DefaultWebStuckChecks is how many reads in a row a request with no
+// deadline may show no sign of its answer being written before it ends as
+// stuck (stuckWatch): at the 20-second read cadence, about 5 minutes of
+// reads. It is a count of reads that each found nothing alive, not a
+// deadline: one sign of life starts the count again.
+const DefaultWebStuckChecks = 15
+
 // DefaultWebLeaseRenew is how often a web agent posts a progress note
 // while it waits for a reply. Each note renews the claim by its lease, and
 // 4 minutes stays inside the shortest one (an urgent request's 10).
@@ -164,10 +171,20 @@ func (w *WebAgent) stableRule() *stableRule {
 // back off too, and are retried until ctx ends.
 func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, onBind func(string)) (json.RawMessage, string, error) {
 	clock := w.clk()
-	// The budget is ctx's deadline on the wait's own clock.
-	budgetEnd := clock.Now().Add(w.requestTimeout())
+	// The budget is ctx's deadline on the wait's own clock. A request with
+	// no deadline has no budget: it ends when the reply is finished, on an
+	// error that will not clear, or when the stuck watch finds nothing
+	// alive.
+	var budgetEnd time.Time
 	if dl, ok := ctx.Deadline(); ok {
 		budgetEnd = clock.Now().Add(time.Until(dl))
+	} else if d, ok := w.requestTimeout(); ok {
+		budgetEnd = clock.Now().Add(d)
+	}
+	over := func(d time.Duration) bool { return !budgetEnd.IsZero() && clock.Now().Add(d).After(budgetEnd) }
+	var stuck *stuckWatch
+	if budgetEnd.IsZero() {
+		stuck = w.newStuckWatch(convID)
 	}
 	keep := claimKeeperFrom(ctx)
 	stable := w.stableRule()
@@ -177,7 +194,7 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 	reads, limited, failures := 0, 0, 0
 	delay := w.pollDelay(0)
 	for {
-		if clock.Now().Add(delay).After(budgetEnd) {
+		if over(delay) {
 			return nil, a.bound, context.DeadlineExceeded
 		}
 		if err := keep.sleep(ctx, clock, delay); err != nil {
@@ -226,6 +243,9 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			if p.finished {
 				return raw, a.bound, nil
 			}
+			if serr := stuck.check(ctx, p.sig, nil); serr != nil {
+				return nil, a.bound, serr
+			}
 			switch {
 			case !p.found || stable == nil:
 				prev, seen = "", 0
@@ -244,7 +264,10 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			}
 			// Everything else in this process holds back as long.
 			w.Native.cooldown().Note(w.Site, after)
-			if clock.Now().Add(after).After(budgetEnd) {
+			if serr := stuck.check(ctx, "", err); serr != nil {
+				return nil, a.bound, serr
+			}
+			if over(after) {
 				w.logf("conversation %s: %s is rate-limiting this account; the wait of %s is past this request's budget", convID, siteLabel(w.Site), after)
 				return nil, a.bound, err
 			}
@@ -254,6 +277,9 @@ func (w *WebAgent) waitReply(ctx context.Context, convID string, a replyAnchor, 
 			errors.Is(err, ErrPermissionMissing), errors.Is(err, ErrBlocked), errors.Is(err, ErrPaused):
 			return nil, a.bound, err
 		default:
+			if serr := stuck.check(ctx, "", err); serr != nil {
+				return nil, a.bound, serr
+			}
 			failures++
 			delay = min(w.pollDelay(reads)<<min(failures, 10), maxErrorBackoff)
 			kind := "retrying"
@@ -280,6 +306,9 @@ type claimKeeper struct {
 	// off: the relay takes no progress notes, so there is nothing to
 	// renew with.
 	off bool
+	// onRenew, when set, runs after each renewal (the wait refreshes its
+	// send journal entry, so the entry outlives a wait of any length).
+	onRenew func(now time.Time)
 }
 
 type claimKeeperKey struct{}
@@ -342,6 +371,97 @@ func (k *claimKeeper) renewIfDue(ctx context.Context, now time.Time) {
 		// on a requeued request, so the wait goes on.
 		k.w.logf("request %s: renewing the claim: %v", k.id, err)
 	}
+	if k.onRenew != nil {
+		k.onRenew(now)
+	}
+}
+
+// errStuck ends a request with no deadline whose answer shows no sign of
+// being written any more; errConversationGone one whose conversation can
+// no longer be read at all.
+var (
+	errStuck            = errors.New("the answer stopped: its tab is gone or idle and the conversation has not changed")
+	errConversationGone = errors.New("the conversation is gone")
+)
+
+// stuckWatch decides when a request with no deadline is dead, from what
+// the page and the conversation show rather than from the clock. After
+// every read that does not find the answer finished, the answer counts as
+// alive when the conversation's reply changed since the last read, or the
+// send's tab is open and its page shows the answer being written (the
+// site's stop button or streaming mark) or its answer text grew. Only
+// limit reads in a row with none of those end the request (errStuck).
+// The conversation itself being unreadable as not found for limit reads in
+// a row ends it too (errConversationGone), whatever the tab shows. An
+// extension that cannot report its tab (one older than this release) is
+// taken as alive, so with it only a finished answer, an error that will
+// not clear or a gone conversation ends the request.
+type stuckWatch struct {
+	w      *WebAgent
+	convID string
+	limit  int
+	sig    string
+	chars  int
+	// idle and missing count reads in a row with no sign of life and with
+	// the conversation not found.
+	idle, missing int
+	// blind: the extension cannot report its tab; logged once.
+	blind bool
+}
+
+func (w *WebAgent) newStuckWatch(convID string) *stuckWatch {
+	limit := w.StuckChecks
+	if limit <= 0 {
+		limit = DefaultWebStuckChecks
+	}
+	return &stuckWatch{w: w, convID: convID, limit: limit}
+}
+
+// check takes one read: sig is the reply's fingerprint when the read
+// succeeded, readErr the read's error otherwise. It returns the error that
+// ends the request, or nil to keep waiting. A nil watch never ends one.
+func (s *stuckWatch) check(ctx context.Context, sig string, readErr error) error {
+	if s == nil {
+		return nil
+	}
+	if errors.Is(readErr, ErrNotFound) {
+		if s.missing++; s.missing >= s.limit {
+			return errConversationGone
+		}
+	} else {
+		s.missing = 0
+	}
+	alive := readErr == nil && sig != s.sig
+	if readErr == nil {
+		s.sig = sig
+	}
+	tctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	st, err := s.w.Native.TabState(tctx, s.w.Site, s.convID)
+	cancel()
+	switch {
+	case err != nil:
+		if !s.blind {
+			s.blind = true
+			s.w.logf("conversation %s: the extension cannot report its tab (%v); waiting for the answer without the stuck check", s.convID, err)
+		}
+		alive = true
+	case st.Open && st.Generating:
+		alive = true
+	case st.Open && st.AssistantChars != s.chars:
+		alive = true
+	}
+	if err == nil {
+		s.chars = st.AssistantChars
+	}
+	if alive {
+		s.idle = 0
+		return nil
+	}
+	if s.idle++; s.idle >= s.limit {
+		s.w.logf("conversation %s: no sign of the answer being written on %d reads in a row (tab open %t); ending the request", s.convID, s.idle, st.Open)
+		return errStuck
+	}
+	return nil
 }
 
 // waitedText is a wait's length in whole minutes ("25m", "2h05m").
