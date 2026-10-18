@@ -27,9 +27,18 @@ import (
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
-// DefaultWebRequestTimeout bounds one web agent request: the send, the
-// wait for the reply to finish, and the reads after it.
+// DefaultWebRequestTimeout bounds one web agent request on a site with no
+// request timeout of its own: the send, the wait for the reply to finish,
+// and the reads after it.
 const DefaultWebRequestTimeout = 8 * time.Minute
+
+// DefaultChatGPTRequestTimeout is ChatGPT's request timeout: a Pro or deep
+// research answer can take well over an hour.
+const DefaultChatGPTRequestTimeout = 4 * time.Hour
+
+// MaxWebRequestTimeout caps every request timeout, configured or asked
+// for with a timeout: line: the relay's default request lifetime.
+const MaxWebRequestTimeout = 24 * time.Hour
 
 // webClockSkew is how much earlier than the extension's submitted_at the
 // site may date the new message and still have it count as this send's.
@@ -122,9 +131,17 @@ type WebAgent struct {
 	JournalRetention time.Duration
 	// TempDir is where per-request image dirs are made (os.TempDir when
 	// empty).
-	TempDir        string
-	Hold           time.Duration
+	TempDir string
+	Hold    time.Duration
+	// RequestTimeout bounds one request (the site's own timeout, else
+	// DefaultWebRequestTimeout, when zero; at most MaxWebRequestTimeout).
+	// A request's own timeout: line replaces it.
 	RequestTimeout time.Duration
+	// LeaseRenew is how often the agent posts a progress note while it
+	// waits for a reply, which renews its claim so the relay never
+	// requeues a request whose answer is still being written
+	// (DefaultWebLeaseRenew when zero).
+	LeaseRenew time.Duration
 	// PollInterval, when set, reads the conversation at this fixed
 	// interval while waiting for the reply instead of on
 	// DefaultWebPollSchedule (tests use it).
@@ -214,11 +231,7 @@ func (w *WebAgent) PollOnce(ctx context.Context) (int, error) {
 }
 
 func (w *WebAgent) handleSafely(ctx context.Context, req envelope.Request) {
-	timeout := w.RequestTimeout
-	if timeout <= 0 {
-		timeout = DefaultWebRequestTimeout
-	}
-	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	hctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), w.timeoutFor(req))
 	defer cancel()
 	defer w.keepPresence(hctx)()
 	defer func() {
@@ -228,6 +241,34 @@ func (w *WebAgent) handleSafely(ctx context.Context, req envelope.Request) {
 		}
 	}()
 	w.Handle(hctx, req)
+}
+
+// requestTimeout is the bound on one request: RequestTimeout, else the
+// site's own, else DefaultWebRequestTimeout, never over
+// MaxWebRequestTimeout.
+func (w *WebAgent) requestTimeout() time.Duration {
+	d := w.RequestTimeout
+	if d <= 0 {
+		if s := siteFor(w.Site); s != nil {
+			d = s.requestTimeout
+		}
+	}
+	if d <= 0 {
+		d = DefaultWebRequestTimeout
+	}
+	return min(d, MaxWebRequestTimeout)
+}
+
+// timeoutFor is req's bound: its own timeout: line when it has one, else
+// requestTimeout. A one-thread site (a dot) sends the body as is, so a
+// timeout: line there is text.
+func (w *WebAgent) timeoutFor(req envelope.Request) time.Duration {
+	if s := siteFor(w.Site); s != nil && !s.oneThread {
+		if wr, err := parseWebRequest(req.Body); err == nil && wr.timeout > 0 {
+			return wr.timeout
+		}
+	}
+	return w.requestTimeout()
 }
 
 func (w *WebAgent) reply(ctx context.Context, req envelope.Request, body string, status envelope.Status, ids []string) {
@@ -249,6 +290,9 @@ type webRequest struct {
 	mode    webThread
 	convID  string
 	message string
+	// timeout is the request's own bound from a timeout: line (zero when
+	// it has none), at most MaxWebRequestTimeout.
+	timeout time.Duration
 }
 
 var convURLPattern = regexp.MustCompile(`^/(?:g/[A-Za-z0-9_-]+/)?(?:c|chat)/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/?$`)
@@ -259,10 +303,46 @@ const NewChat = "new chat"
 
 const threadingHelp = `Put "new chat" or "conversation: <id>" on the first line to choose the conversation, and the message after it.`
 
-// parseWebRequest reads the optional threading line: "new chat" or
-// "conversation: <id>" (an id, or a conversation URL on a site in the
-// table) on the first line. Everything else is the message, sent as is.
+// timeoutLine reads a leading "timeout: <duration>" line (a Go duration
+// such as 90m or 6h, above zero): the duration, capped at
+// MaxWebRequestTimeout, and the body after the line. Any other first line,
+// including a timeout: line whose value is not such a duration, is not
+// one, and the body is returned as is.
+func timeoutLine(body string) (time.Duration, string, bool) {
+	first, rest, _ := strings.Cut(strings.TrimLeft(body, " \t\r\n"), "\n")
+	head := strings.TrimSpace(first)
+	if len(head) < len("timeout:") || !strings.EqualFold(head[:len("timeout:")], "timeout:") {
+		return 0, body, false
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(head[len("timeout:"):]))
+	if err != nil || d <= 0 {
+		return 0, body, false
+	}
+	return min(d, MaxWebRequestTimeout), rest, true
+}
+
+// parseWebRequest reads the optional leading lines: the threading line,
+// "new chat" or "conversation: <id>" (an id, or a conversation URL on a
+// site in the table), and a "timeout: <duration>" line (see timeoutLine)
+// just before or just after it. Everything else is the message, sent as
+// is.
 func parseWebRequest(body string) (webRequest, error) {
+	timeout, body, early := timeoutLine(body)
+	r, err := parseThreading(body)
+	if err == nil && !early && r.mode != threadContinue {
+		var late bool
+		var msg string
+		if timeout, msg, late = timeoutLine(r.message); late {
+			if r.message = strings.TrimSpace(msg); r.message == "" {
+				return webRequest{}, errors.New("there is no message to send")
+			}
+		}
+	}
+	r.timeout = timeout
+	return r, err
+}
+
+func parseThreading(body string) (webRequest, error) {
 	first, rest, _ := strings.Cut(body, "\n")
 	head := strings.ToLower(strings.TrimSpace(first))
 	r := webRequest{mode: threadContinue, message: strings.TrimSpace(body)}
@@ -375,6 +455,9 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 		w.logf("request %s from %s: claim failed: %v", req.ID, req.From, err)
 		return
 	}
+	// The reply can take hours (a ChatGPT Pro answer): the wait renews the
+	// claim as it goes, so the relay never requeues the request meanwhile.
+	ctx = w.keepClaim(ctx, req)
 	site, err := lookupSite(w.Site)
 	if err != nil {
 		w.logf("request %s from %s: %v", req.ID, req.From, err)
@@ -520,6 +603,11 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 		delete(st.Conversations, req.From)
 		convID, newChat, err = "", true, nil
 		anchor = replyAnchor{message: wr.message}
+	}
+	if errors.Is(err, errStillAnswering) {
+		w.logf("request %s from %s: conversation %s is still answering; not sending", req.ID, req.From, convID)
+		w.reply(ctx, req, fmt.Sprintf("Nothing was sent to %s: the conversation %s is still writing an answer to an earlier message, and tincan never types into a conversation while it answers. Wait for that answer to finish and ask again, or start a new chat with new chat on the first line.", label, convID), envelope.StatusFailed, nil)
+		return
 	}
 	if err != nil {
 		w.logf("request %s from %s: reading the conversation before the send: %v; not sending", req.ID, req.From, err)
@@ -962,6 +1050,9 @@ func (w *WebAgent) anchorFor(ctx context.Context, convID, message string) (reply
 			for i := len(nodes) - 1; i >= 0; i-- {
 				if nodes[i].user {
 					a.prevUser = nodes[i].id
+					if w.site().refuseWhileAnswering && stillAnswering(nodes[i], progressOf(nodes, replyAnchor{bound: nodes[i].id}), w.clk().Now()) {
+						return a, errStillAnswering
+					}
 					break
 				}
 			}
@@ -1228,6 +1319,22 @@ var errReplyUnreadable = errors.New("the reply could not be read")
 // errThreadTooLong: the conversation is longer than the extension reads,
 // so its newest turns (this request's) cannot be seen.
 var errThreadTooLong = errors.New("the conversation is longer than tincan reads")
+
+// errStillAnswering: the conversation's latest answer is still being
+// written, so nothing is typed into it (a follow-up there would land on a
+// running answer).
+var errStillAnswering = errors.New("the conversation is still answering an earlier message")
+
+// stillAnswering reports whether the turn of the conversation's last user
+// message u, judged as p, is an answer the site has not finished. A turn
+// with no answer yet is not (it may never get one), nor is one older than
+// MaxWebRequestTimeout, which no request is still waiting on.
+func stillAnswering(u webNode, p replyProgress, now time.Time) bool {
+	if !p.found || p.finished {
+		return false
+	}
+	return u.at.IsZero() || now.Sub(u.at) < MaxWebRequestTimeout
+}
 
 // webReply is the answer read from the finished conversation: its text,
 // its fetched images (conv), how many images it had before any failed to

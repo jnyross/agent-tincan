@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -439,5 +440,50 @@ func TestWebServeDotsNeedsDotWebKind(t *testing.T) {
 			}
 		}
 		srv.Close()
+	}
+}
+
+// web serve's request timeout: --request-timeout, else
+// $TINCAN_WEB_REQUEST_TIMEOUT, else zero (the site's own default); either
+// must be above zero and at most history.MaxWebRequestTimeout.
+func TestWebRequestTimeoutFlagAndEnv(t *testing.T) {
+	for _, c := range []struct {
+		flag    time.Duration
+		set     bool
+		env     string
+		want    time.Duration
+		wantErr string
+	}{
+		{want: 0},
+		{env: "6h", want: 6 * time.Hour},
+		{flag: 90 * time.Minute, set: true, env: "6h", want: 90 * time.Minute},
+		{flag: 0, set: true, wantErr: "--request-timeout must be above 0"},
+		{flag: 25 * time.Hour, set: true, wantErr: "at most 24h0m0s"},
+		{env: "soon", wantErr: "TINCAN_WEB_REQUEST_TIMEOUT=\"soon\" is not a duration"},
+		{env: "-1m", wantErr: "TINCAN_WEB_REQUEST_TIMEOUT must be above 0"},
+	} {
+		got, err := webRequestTimeout(c.flag, c.set, c.env)
+		if c.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+				t.Errorf("%+v: err %v, want %q", c, err, c.wantErr)
+			}
+			continue
+		}
+		if err != nil || got != c.want {
+			t.Errorf("%+v: %s %v, want %s", c, got, err, c.want)
+		}
+	}
+}
+
+// web serve takes the flag and checks it before it reads any config.
+func TestWebServeRejectsBadRequestTimeout(t *testing.T) {
+	t.Setenv(webRequestTimeoutEnv, "")
+	cmd := webServeCmd()
+	cmd.SetArgs([]string{"--site", "chatgpt", "--request-timeout", "48h", "--config", filepath.Join(t.TempDir(), "missing.json")})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--request-timeout must be above 0 and at most 24h0m0s, got 48h0m0s") {
+		t.Fatalf("err %v", err)
 	}
 }

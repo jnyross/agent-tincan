@@ -28,8 +28,11 @@
 // conversation through the existing detail operation until the reply is
 // finished, then calls the close operation with the conversation id. The
 // tab stays open until then because closing it may stop claude.ai from
-// finishing the reply. A tab nobody closes is closed after keepMs anyway.
-// A send that fails closes its tab at once.
+// finishing the reply. A tab nobody closes is looked at every keepMs: it
+// stays while the page still shows the answer being written (a ChatGPT
+// Pro answer can take hours), and is closed once it does not, or at
+// keepMaxMs whatever the page shows. A send that fails closes its tab at
+// once.
 //
 // An OpenAI dot's DM is the one exception to step 3: its address never
 // changes, so the send is confirmed by the room feed instead. The DM lives
@@ -63,8 +66,11 @@ export const SEND_TIMEOUT_MS = 5 * 60 * 1000;
 // ID_WAIT_MS bounds the wait for the conversation id after the send.
 export const ID_WAIT_MS = 60 * 1000;
 // KEEP_TAB_MS is how long a finished send's tab may stay open waiting for
-// its close operation.
+// its close operation before the page is looked at; while it shows the
+// answer still being written it gets KEEP_TAB_MS more, up to KEEP_TAB_MAX_MS
+// from the send (the Go side's longest request timeout, 24 hours).
 export const KEEP_TAB_MS = 10 * 60 * 1000;
+export const KEEP_TAB_MAX_MS = 24 * 60 * 60 * 1000;
 // READ_TIMEOUT_MS bounds one Copilot tab read from when it is queued
 // (waiting, load and scrolling included), under the Go client's 100 second
 // wait for it (TabReadClientTimeout); READ_GAP_MS is the least time between
@@ -720,6 +726,7 @@ export function createSender({
   sendConfirmMs = 15000,
   idWaitMs = ID_WAIT_MS,
   keepMs = KEEP_TAB_MS,
+  keepMaxMs = KEEP_TAB_MAX_MS,
   settleMs = 1500,
   readMs = READ_TIMEOUT_MS,
   readGapMs = READ_GAP_MS,
@@ -770,13 +777,38 @@ export function createSender({
     }
   }
 
+  // keep holds a finished send's tab for its close operation. Every keepMs
+  // the page is probed (read only): while it still shows the answer being
+  // written the tab is kept, since closing it may stop the answer; once it
+  // does not, or the probe fails, or keepMaxMs has passed since the send,
+  // the tab is closed.
   function keep(tabId, site, id) {
-    const timer = setTimer(() => {
-      if (kept.get(tabId)?.timer !== timer) return;
-      kept.delete(tabId);
-      removeTab(tabId);
-    }, keepMs);
-    kept.set(tabId, { site, id, timer });
+    const since = now();
+    const arm = () => {
+      const timer = setTimer(async () => {
+        if (kept.get(tabId)?.timer !== timer) return;
+        if (now() - since < keepMaxMs && (await stillWriting(tabId, site))) {
+          if (kept.get(tabId)?.timer === timer) arm();
+          return;
+        }
+        if (kept.get(tabId)?.timer !== timer) return;
+        kept.delete(tabId);
+        removeTab(tabId);
+      }, keepMs);
+      kept.set(tabId, { site, id, timer });
+    };
+    arm();
+  }
+
+  // stillWriting reports whether a kept tab's page shows an answer being
+  // written (its stop button or streaming mark). A tab that cannot be
+  // probed is not.
+  async function stillWriting(tabId, site) {
+    try {
+      return cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true)).generating;
+    } catch {
+      return false;
+    }
   }
 
   async function closeKept(match) {

@@ -8,11 +8,14 @@ import (
 	"time"
 )
 
-// DefaultWebJournalRetention is how long a send journal entry is kept: the
-// relay's 30-minute claim lease (after which it requeues a claimed request
-// that got no reply) plus a margin for a second requeue and the request
-// timeout.
-const DefaultWebJournalRetention = 30*time.Minute + time.Hour
+// DefaultWebJournalRetention is how long a send journal entry is kept: as
+// long as any request can still be waiting for its reply (the longest
+// request timeout), plus the relay's 30-minute claim lease (after which it
+// requeues a claim that went quiet, as when the agent crashed) and a
+// margin for a second requeue. An entry pruned while its request could
+// still come back would let the request be typed into its conversation a
+// second time.
+const DefaultWebJournalRetention = MaxWebRequestTimeout + 30*time.Minute + time.Hour
 
 // webJournal is the send journal: request id -> what was sent for it. It
 // holds ids and times only, never messages or replies. A requeued request

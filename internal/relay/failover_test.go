@@ -181,28 +181,33 @@ func TestFailoverIneligible(t *testing.T) {
 	if why := failoverIneligible(ask, false, "codex", "claude-web"); why != "" {
 		t.Fatalf("plain ask: %s", why)
 	}
+	if why := failoverIneligible(with(func(r *envelope.Request) { r.Body = "timeout: 6h\nnew chat\nsummarize this paper" }), false, "codex", "claude-web"); why != "" {
+		t.Fatalf("an ask with its own timeout: %s", why)
+	}
 	for name, tc := range map[string]struct {
 		req      envelope.Request
 		claimed  bool
 		from, to string
 	}{
-		"held":           {req: with(func(r *envelope.Request) { r.WasHeld, r.Approved = true, true })},
-		"notify":         {req: with(func(r *envelope.Request) { r.Kind = envelope.KindNotify })},
-		"group":          {req: with(func(r *envelope.Request) { r.Group = "g1" })},
-		"room mention":   {req: with(func(r *envelope.Request) { r.RoomPostID = 7 })},
-		"attachments":    {req: with(func(r *envelope.Request) { r.Attachments = []envelope.Attachment{{ID: "a"}} })},
-		"conversation":   {req: with(func(r *envelope.Request) { r.Body = "  Conversation: abc123\nand more" })},
-		"exchange":       {req: with(func(r *envelope.Request) { r.Exchanges = []envelope.Exchange{{Question: "which?"}} })},
-		"resumed":        {req: with(func(r *envelope.Request) { r.Resumed = true })},
-		"maybe sent":     {req: ask, claimed: true},
-		"to dot-web":     {req: ask, to: "dot-web"},
-		"from dot-web":   {req: ask, from: "dot-web"},
-		"from council":   {req: ask, from: "council"},
-		"to a CLI":       {req: ask, to: "codex"},
-		"to copilot-cli": {req: ask, to: "copilot-cli"},
-		"to cursor-cli":  {req: ask, to: "cursor-cli"},
-		"to no kind":     {req: ask, to: "-"},
-		"to the council": {req: ask, to: "council"},
+		"held":                          {req: with(func(r *envelope.Request) { r.WasHeld, r.Approved = true, true })},
+		"notify":                        {req: with(func(r *envelope.Request) { r.Kind = envelope.KindNotify })},
+		"group":                         {req: with(func(r *envelope.Request) { r.Group = "g1" })},
+		"room mention":                  {req: with(func(r *envelope.Request) { r.RoomPostID = 7 })},
+		"attachments":                   {req: with(func(r *envelope.Request) { r.Attachments = []envelope.Attachment{{ID: "a"}} })},
+		"conversation":                  {req: with(func(r *envelope.Request) { r.Body = "  Conversation: abc123\nand more" })},
+		"timeout then conversation":     {req: with(func(r *envelope.Request) { r.Body = "timeout: 6h\nconversation: abc123\nand more" })},
+		"odd timeout then conversation": {req: with(func(r *envelope.Request) { r.Body = " Timeout: later\n Conversation: abc123\nand more" })},
+		"exchange":                      {req: with(func(r *envelope.Request) { r.Exchanges = []envelope.Exchange{{Question: "which?"}} })},
+		"resumed":                       {req: with(func(r *envelope.Request) { r.Resumed = true })},
+		"maybe sent":                    {req: ask, claimed: true},
+		"to dot-web":                    {req: ask, to: "dot-web"},
+		"from dot-web":                  {req: ask, from: "dot-web"},
+		"from council":                  {req: ask, from: "council"},
+		"to a CLI":                      {req: ask, to: "codex"},
+		"to copilot-cli":                {req: ask, to: "copilot-cli"},
+		"to cursor-cli":                 {req: ask, to: "cursor-cli"},
+		"to no kind":                    {req: ask, to: "-"},
+		"to the council":                {req: ask, to: "council"},
 	} {
 		from, to := tc.from, tc.to
 		if from == "" {

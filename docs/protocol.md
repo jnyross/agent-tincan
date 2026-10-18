@@ -507,7 +507,8 @@ at two points only:
 
 An ask never moves when it is to or from `dot-web`, from a `council`, was ever
 held for approval, is a `notify` or `ping`, is in a group, came from a room
-mention, carries attachments, starts with a `conversation:` line, has a
+mention, carries attachments, names a conversation (a first `conversation:` line, or one
+right after a first `timeout:` line), has a
 clarification exchange or was resumed,
 or was ever claimed and then requeued (it may have been typed into a site), or
 when its target is not a web chat agent. Such an ask is delivered as before, and
