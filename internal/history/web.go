@@ -1032,7 +1032,7 @@ func (w *WebAgent) waitFailure(err error, convID string) string {
 	}
 	switch {
 	case errors.Is(err, errStuck):
-		return fmt.Sprintf("Sorry, %s stopped writing its answer: the tab it was written in is gone or no longer shows it being written, and the conversation has not changed since. The message was sent to %s (conversation %s); open the conversation to see where it stopped, and ask for the reply later instead of sending it again.", label, label, convID)
+		return fmt.Sprintf("Sorry, %s stopped writing its answer: the tab it was written in was closed, crashed or moved away, and the conversation has not changed since. The message was sent to %s (conversation %s); open the conversation to see where it stopped, and ask for the reply later instead of sending it again.", label, label, convID)
 	case errors.Is(err, errConversationGone):
 		return fmt.Sprintf("Sorry, the %s conversation %s is gone (deleted, or no longer readable), so its answer cannot be read. The message was sent.", label, convID)
 	}

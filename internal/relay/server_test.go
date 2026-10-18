@@ -1418,3 +1418,38 @@ func TestAgentsListShowsNodeToAdminOnly(t *testing.T) {
 		t.Errorf("old client decoded %d agents, want %d", len(old.Agents), len(admin.Agents))
 	}
 }
+
+// An ask to a chatgpt-web teammate never expires: its answers have no
+// deadline and it answers one at a time, so an ask can wait queued behind a
+// long one for more than a day. The kind decides, and an agent with no
+// kind under the product name chatgpt-web gets the same; another web chat
+// kind keeps the 24-hour lifetime.
+func TestChatGPTWebRequestsDoNotExpire(t *testing.T) {
+	h, clock := ttlHarness(t, Config{})
+	h.do(macAddr, "PUT", "/v1/agents/muse/kind", `{"kind":"chatgpt-web"}`, http.StatusOK, nil)
+	h.do(macAddr, "PUT", "/v1/agents/instinct/kind", `{"kind":"claude-web"}`, http.StatusOK, nil)
+	queued := h.send(grokAddr, "muse", "queued behind a long answer")
+	claude := h.send(grokAddr, "instinct", "a claude ask")
+	if got := ttlOf(t, h, queued.ID); got != NoRequestExpiry {
+		t.Errorf("chatgpt-web ttl = %v, want NoRequestExpiry", got)
+	}
+	if got := ttlOf(t, h, claude.ID); got != 24*time.Hour {
+		t.Errorf("claude-web ttl = %v, want 24h", got)
+	}
+	clock.advance(30 * 24 * time.Hour)
+	h.srv.Sweep(context.Background())
+	if s := statusOf(t, h, grokAddr, queued.ID); s != envelope.StatusQueued {
+		t.Fatalf("chatgpt-web ask after 30 days = %s, want queued", s)
+	}
+	if s := statusOf(t, h, grokAddr, claude.ID); s != envelope.StatusExpired {
+		t.Fatalf("claude-web ask after 30 days = %s, want expired", s)
+	}
+	if got := h.srv.requestTTL(context.Background(), "chatgpt-web"); got != NoRequestExpiry {
+		t.Errorf("unknown agent named chatgpt-web: ttl %v", got)
+	}
+	// Only chatgpt-web falls back to its name: a kind-less agent named
+	// notes keeps the relay's lifetime.
+	if got := h.srv.requestTTL(context.Background(), "notes"); got != 24*time.Hour {
+		t.Errorf("unknown agent named notes: ttl %v, want 24h", got)
+	}
+}

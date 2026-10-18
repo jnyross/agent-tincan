@@ -99,7 +99,8 @@ destination of the approval policy.
 
 An unanswered request expires after 24 hours, except one to a notes-kind
 agent, which waits --notes-ttl (30 days by default) so a sleeping notes Mac
-loses nothing.
+loses nothing, and one to a chatgpt-web agent, which never expires: its
+answers have no deadline, so an ask can wait hours behind a long one.
 
 A rebuilt machine (a new Tailscale node with the same machine name, or that
 name plus a "-1" style suffix) is re-admitted as its old agent on its first

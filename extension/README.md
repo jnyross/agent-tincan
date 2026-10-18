@@ -16,14 +16,19 @@ click send, and return once the conversation id is in the tab's address. They
 never watch the page for the answer: the Go side reads the conversation until
 the answer is finished, then calls `chatgpt.close`, `claudeai.close`, `grok.close`, `gemini.close`, `perplexity.close` or `copilot.close`, which
 close only the tab a send left open for that conversation. A tab nobody
-closes is probed every 10 minutes and kept while its page still shows the
-answer being written, then closed. While a kept tab is open,
+closes is looked at every 10 minutes and kept while the Go side read its
+state in those 10 minutes or its page still shows the answer being written
+or thought through (stop button, streaming mark, or ChatGPT's thinking
+indicator or reasoning or summary panel, `SELECTORS.chatgpt.thinking` and
+`thinkingText`), then closed. While a kept tab is open,
 `chatgpt.tab {conversation_id}` (and `claudeai.tab`, `grok.tab`,
 `gemini.tab`, `perplexity.tab`, `copilot.tab`, `dots.tab`) reports it with
-the same read-only page probe: `{open, generating, assistant_chars}`, the
-last answer's text length as a number, never the text. It types and clicks
-nothing, reaches no site and needs no grant; the Go side's stuck check reads
-it for a request with no deadline. A send tab the site moves to another
+the same read-only page probe: `{open, generating, thinking,
+assistant_chars}`, the last answer's text length as a number, never the
+text. A tab closed, crashed, sent off the site or moved to another
+conversation is `{open: false}`. It types and clicks nothing, reaches no site
+and needs no grant; the Go side's stuck check reads it for a request with no
+deadline. A send tab the site moves to another
 host is never typed into: Google's `/sorry/` page is `blocked`, any other host
 (a sign-in page) `not_logged_in`.
 All page selectors are in the `SELECTORS` table in `send.js`; see

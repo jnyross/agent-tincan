@@ -124,7 +124,7 @@ func webServeCmd() *cobra.Command {
 			"  4. the reply text (capped) comes back; ChatGPT and Grok attach their generated images, Gemini's when they can be fetched,\n" +
 			"     and Perplexity's and Copilot's answers end with their source links.\n" +
 			"A ChatGPT request has no deadline: it ends when the answer is finished, on an error that will not clear, or when the\n" +
-			"answer is stuck (its tab gone or idle and the conversation unchanged for 15 reads in a row). Other sites' requests have an\n" +
+			"answer's tab is dead (closed, crashed or moved away, with the conversation unchanged, for 15 reads in a row). Other sites' requests have an\n" +
 			"8m deadline. --request-timeout (or $" + webRequestTimeoutEnv + ") sets a deadline for every request, 0 takes it off every site.\n" +
 			"A line \"timeout: <duration>\" (such as timeout: 6h), first or after the threading line, sets one request's own.\n" +
 			"While it waits the agent posts a progress note every 4 minutes, which keeps its claim, so the relay never requeues it.\n" +

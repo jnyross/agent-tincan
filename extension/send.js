@@ -97,6 +97,14 @@ export const MAX_NOTICE = 500;
 // lists the page's alert and status regions: a send reports their text as
 // is, and the Go side reads a usage limit from it.
 const NOTICE = Object.freeze(['[role="alert"]', '[role="status"]']);
+// thinking, where a site has it, lists the marks of an answer that is being
+// thought through before any of it shows (ChatGPT Pro's thinking indicator,
+// its reasoning or summary panel), and thinkingText the words that mark it
+// in the page's alert and status regions, matched in any case. Either counts
+// as the answer being written for a kept tab (pageProbe's thinking), never
+// to refuse or confirm a send.
+const CHATGPT_THINKING = Object.freeze(['[data-testid*="thinking" i]', '[data-testid*="reasoning" i]', '[data-testid*="thoughts" i]', '[aria-label*="thinking" i]', '[aria-label*="reasoning" i]']);
+const CHATGPT_THINKING_TEXT = Object.freeze(['thinking', 'reasoning', 'thought for']);
 
 export const SELECTORS = Object.freeze({
   chatgpt: Object.freeze({
@@ -104,6 +112,8 @@ export const SELECTORS = Object.freeze({
     send: ['[data-testid="send-button"]', '#composer-submit-button', 'button[aria-label*="Send"]'],
     stop: ['[data-testid="stop-button"]', 'button[aria-label*="Stop"]'],
     streaming: ['.result-streaming'],
+    thinking: CHATGPT_THINKING,
+    thinkingText: CHATGPT_THINKING_TEXT,
     assistant: ['[data-message-author-role="assistant"]'],
     user: ['[data-message-author-role="user"]'],
     notice: NOTICE,
@@ -336,6 +346,11 @@ export function pageProbe(sel) {
     composer: Boolean(composer),
     composerEmpty: draft.trim() === '',
     generating: Boolean(q(sel.stop)) || Boolean(q(sel.streaming)),
+    // Thinking before any answer shows: a thinking or reasoning mark, or
+    // its words in an alert or status region.
+    thinking:
+      Boolean(q(Array.isArray(sel.thinking) ? sel.thinking : [])) ||
+      (Array.isArray(sel.thinkingText) && notice.some((t) => sel.thinkingText.some((w) => t.toLowerCase().includes(w)))),
     assistantCount: qa(sel.assistant).length,
     // The last answer's text length: it grows while the answer is written.
     assistantChars: textOf(qa(sel.assistant).at(-1)).length,
@@ -659,6 +674,7 @@ function cleanProbe(r) {
     composer: o.composer === true,
     composerEmpty: o.composerEmpty === true,
     generating: o.generating === true,
+    thinking: o.thinking === true,
     assistantCount: Number.isSafeInteger(o.assistantCount) ? o.assistantCount : 0,
     assistantChars: Number.isSafeInteger(o.assistantChars) && o.assistantChars >= 0 ? o.assistantChars : 0,
     userCount: Number.isSafeInteger(o.userCount) ? o.userCount : 0,
@@ -781,16 +797,22 @@ export function createSender({
   }
 
   // keep holds a finished send's tab for its close operation. Every keepMs
-  // the page is probed (read only): while it still shows the answer being
-  // written the tab is kept, since closing it may stop the answer; once it
-  // does not, or the probe fails, or a keepMaxMs given has passed since the
-  // send, the tab is closed.
+  // the tab is looked at: it is kept while the Go side is still waiting on
+  // it (it read the tab's state with tabState within the last keepMs) or
+  // its page (read only) shows the answer being written or thought through,
+  // since closing it may stop the answer. Once neither holds, or the probe
+  // fails, or a keepMaxMs given has passed since the send, it is closed. So
+  // the tab of an answer the Go side waits on is never closed under it,
+  // whatever the page shows; one nobody waits on closes when it goes quiet.
   function keep(tabId, site, id) {
     const since = now();
+    // watched is when tabState last read the tab (never, to begin with).
+    const entry = { site, id, timer: null, watched: -Infinity };
     const arm = () => {
       const timer = setTimer(async () => {
         if (kept.get(tabId)?.timer !== timer) return;
-        if (now() - since < keepMaxMs && (await stillWriting(tabId, site))) {
+        const watched = now() - entry.watched < keepMs;
+        if (now() - since < keepMaxMs && (watched || (await stillWriting(tabId, site)))) {
           if (kept.get(tabId)?.timer === timer) arm();
           return;
         }
@@ -798,42 +820,63 @@ export function createSender({
         kept.delete(tabId);
         removeTab(tabId);
       }, keepMs);
-      kept.set(tabId, { site, id, timer });
+      entry.timer = timer;
     };
     arm();
+    kept.set(tabId, entry);
   }
 
   // stillWriting reports whether a kept tab's page shows an answer being
-  // written (its stop button or streaming mark). A tab that cannot be
-  // probed is not.
+  // written or thought through (its stop button, streaming mark, or a
+  // thinking or reasoning mark). A tab that cannot be probed is not.
   async function stillWriting(tabId, site) {
     try {
-      return cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true)).generating;
+      const p = cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true));
+      return p.generating || p.thinking;
     } catch {
       return false;
     }
   }
 
   // tabState reports the kept tab of a finished send to conversationId:
-  // {open, generating, assistant_chars} from the read-only page probe. No
-  // such tab, or one that cannot be probed (closed, or sent off the site),
-  // is {open: false}; a tab that cannot be probed is forgotten and closed.
+  // {open, generating, thinking, assistant_chars} from the read-only page
+  // probe, and marks the tab as watched (keep). No such tab, or one that is
+  // dead (closed, crashed so it cannot be probed, sent off the site, or
+  // moved to another conversation), is {open: false}; a dead tab is
+  // forgotten, and closed unless it moved to another conversation (the owner
+  // is using it).
   async function tabState(site, conversationId) {
-    const entry = [...kept].find(([, k]) => k.site === site && k.id === conversationId);
-    if (!entry) return { open: false, generating: false, assistant_chars: 0 };
-    const [tabId, k] = entry;
+    const closedState = { open: false, generating: false, thinking: false, assistant_chars: 0 };
+    const found = [...kept].find(([, k]) => k.site === site && k.id === conversationId);
+    if (!found) return closedState;
+    const [tabId, k] = found;
+    const cfg = SITES[site];
+    let t;
     try {
-      const t = await tabURL(tabId);
-      if (awayError(t, SITES[site])) throw new Error('away');
+      t = await tabURL(tabId);
+    } catch {
+      t = null;
+    }
+    const m = t && !cfg.confirmByFeed ? cfg.idFrom.exec(t.url) : null;
+    if (m && m[1] !== conversationId) {
+      if (kept.get(tabId) === k) {
+        kept.delete(tabId);
+        clearTimer(k.timer);
+      }
+      return closedState;
+    }
+    try {
+      if (!t || awayError(t, cfg)) throw new Error('away');
       const p = cleanProbe(await inject(tabId, pageProbe, [SELECTORS[site]], true));
-      return { open: true, generating: p.generating, assistant_chars: p.assistantChars };
+      k.watched = now();
+      return { open: true, generating: p.generating, thinking: p.thinking, assistant_chars: p.assistantChars };
     } catch {
       if (kept.get(tabId) === k) {
         kept.delete(tabId);
         clearTimer(k.timer);
         await removeTab(tabId);
       }
-      return { open: false, generating: false, assistant_chars: 0 };
+      return closedState;
     }
   }
 

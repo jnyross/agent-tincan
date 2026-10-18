@@ -979,13 +979,17 @@ func (c *Client) Close(ctx context.Context, src Source, convID string) error {
 }
 
 // TabState is what the extension sees of the tab a send left open for a
-// conversation: whether it is still open, whether its page shows the
-// answer being written (the site's stop button or streaming mark), and the
-// length of the page's last answer text, which grows while it is written.
-// It is read from the page only (the same read-only probe a send uses).
+// conversation: whether it is still open on that conversation (not closed,
+// crashed, sent off the site or moved to another conversation), whether
+// its page shows the answer being written (the site's stop button or
+// streaming mark) or thought through (a thinking or reasoning mark), and
+// the length of the page's last answer text. It is read from the page only
+// (the same read-only probe a send uses), and reading it tells the
+// extension the tab is still waited on.
 type TabState struct {
 	Open           bool `json:"open"`
 	Generating     bool `json:"generating"`
+	Thinking       bool `json:"thinking"`
 	AssistantChars int  `json:"assistant_chars"`
 }
 

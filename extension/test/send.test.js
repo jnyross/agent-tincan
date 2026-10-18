@@ -77,7 +77,7 @@ class FakeSite {
     this.site = site;
     this.sel = SELECTORS[site];
     this.opts = { execWorks: true, pasteWorks: false, streamTicks: 3, loadTicks: 1, ...opts };
-    this.match = { composer: 0, send: 0, stop: 0, streaming: 0, assistant: 0, user: 0, login: 0, blocked: 0, signedIn: 0, dialog: 0, notice: 0, ...(opts.match || {}) };
+    this.match = { composer: 0, send: 0, stop: 0, streaming: 0, thinking: 0, assistant: 0, user: 0, login: 0, blocked: 0, signedIn: 0, dialog: 0, notice: 0, ...(opts.match || {}) };
     this.home = url;
     this.href = this.opts.redirectTo || url;
     this.loadLeft = this.opts.loadTicks;
@@ -155,6 +155,11 @@ class FakeSite {
       case 'streaming':
         if (this.generating && this.opts.streamingMarker) els.push(new El(this, 'DIV'));
         break;
+      case 'thinking':
+        // thinkingPanel: a reasoning or summary panel shows while the
+        // answer is thought through.
+        if (this.generating && this.opts.thinkingPanel) els.push(new El(this, 'DIV', 'Reasoning'));
+        break;
       case 'login':
         if (this.opts.loggedOut) els.push(new El(this, 'A'));
         break;
@@ -189,7 +194,7 @@ class FakeSite {
   lookup(sel) {
     const open = this.dialogs.filter((d) => d.open && d.within === sel).map((d) => d.el);
     if (open.length) return open;
-    for (const r of ['composer', 'send', 'stop', 'streaming', 'assistant', 'user', 'login', 'blocked', 'signedIn', 'dialog', 'notice']) {
+    for (const r of ['composer', 'send', 'stop', 'streaming', 'thinking', 'assistant', 'user', 'login', 'blocked', 'signedIn', 'dialog', 'notice']) {
       if (this.sel[r] && this.sel[r][this.match[r]] === sel) return this.role(r);
     }
     return [];
@@ -544,11 +549,11 @@ test('tabState reports a kept tab: open and writing, its answer growing, then go
   const c = await s.tabState('chatgpt', r.conversation_id);
   assert.deepEqual([c.open, c.generating, c.assistant_chars], [true, false, b.assistant_chars]);
   assert.deepEqual(page.submitted, ['think'], 'tabState typed into the page');
-  assert.deepEqual(await s.tabState('chatgpt', 'some-other-conversation'), { open: false, generating: false, assistant_chars: 0 });
-  assert.deepEqual(await s.tabState('claudeai', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  assert.deepEqual(await s.tabState('chatgpt', 'some-other-conversation'), { open: false, generating: false, thinking: false, assistant_chars: 0 });
+  assert.deepEqual(await s.tabState('claudeai', r.conversation_id), { open: false, generating: false, thinking: false, assistant_chars: 0 });
   // The tab closed under it (the owner closed it): not open, and forgotten.
   await fc.chrome.tabs.remove(100);
-  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, thinking: false, assistant_chars: 0 });
   assert.equal(timers.pending().length, 0);
   assert.equal(s.busy(), false);
   assertOnlyFixedScripts(fc.log);
@@ -560,8 +565,79 @@ test('tabState of a kept tab the site sent to another host is not open, and the 
   const s = sender(fc);
   const r = await s.send('chatgpt', { message: 'x', new_chat: true });
   page.href = 'https://auth.openai.com/log-in';
-  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, assistant_chars: 0 });
+  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, thinking: false, assistant_chars: 0 });
   assert.deepEqual(fc.log.removed, [100]);
+});
+
+// P1 (fix round 1): ChatGPT Pro can think for hours with no stop button or
+// streaming mark showing, only a thinking indicator or a reasoning panel.
+// Either counts as the answer being written, so the kept tab stays.
+test('a Pro thinking tab with no stop button stays open for hours (thinking status text)', async () => {
+  const fc = fakeChrome((url) => new FakeSite('chatgpt', url, { neverFinish: true, stopButton: false, notice: 'Pro thinking' }));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, now: () => fc.now() + later });
+  const r = await s.send('chatgpt', { message: 'Think silently for two hours', new_chat: true });
+  for (let i = 0; i < 15; i++) {
+    later += 10 * 60 * 1000;
+    await fire(timers);
+    assert.deepEqual(fc.log.removed, [], `the thinking tab was closed after ${(i + 1) * 10} minutes`);
+  }
+  const st = await s.tabState('chatgpt', r.conversation_id);
+  assert.deepEqual([st.open, st.generating, st.thinking], [true, false, true]);
+});
+
+test('a reasoning panel with no stop button keeps the tab, and tabState reports it thinking', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true, stopButton: false, thinkingPanel: true })));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, now: () => fc.now() + later });
+  const r = await s.send('chatgpt', { message: 'Reason it through', new_chat: true });
+  for (let i = 0; i < 15; i++) {
+    later += 10 * 60 * 1000;
+    await fire(timers);
+  }
+  assert.deepEqual(fc.log.removed, [], 'the reasoning tab was closed');
+  assert.equal((await s.tabState('chatgpt', r.conversation_id)).thinking, true);
+  page.generating = false; // thought through and answered: nothing shows now
+  later += 20 * 60 * 1000;
+  await fire(timers);
+  assert.deepEqual(fc.log.removed, [100]);
+});
+
+// The keeper and the Go side's stuck check make one decision: a tab the Go
+// side is still waiting on (it read the tab's state within keepMs) is never
+// closed under it, even when its page shows no mark the extension knows.
+test('a kept tab the Go side is watching stays open with no recognised mark; unwatched and quiet it closes', async () => {
+  const fc = fakeChrome((url) => new FakeSite('chatgpt', url, { neverFinish: true, stopButton: false }));
+  const timers = fakeTimers();
+  let later = 0;
+  const s = sender(fc, { timers, keepMs: 10 * 60 * 1000, now: () => fc.now() + later });
+  const r = await s.send('chatgpt', { message: 'Think with no marks at all', new_chat: true });
+  for (let i = 0; i < 18; i++) {
+    later += 5 * 60 * 1000;
+    const st = await s.tabState('chatgpt', r.conversation_id);
+    assert.deepEqual([st.open, st.generating, st.thinking], [true, false, false]);
+    if (i % 2 === 1) await fire(timers);
+    assert.deepEqual(fc.log.removed, [], `a watched tab was closed after ${(i + 1) * 5} minutes`);
+  }
+  later += 11 * 60 * 1000; // the Go side stopped watching
+  await fire(timers);
+  assert.deepEqual(fc.log.removed, [100]);
+});
+
+test('tabState of a kept tab moved to another conversation is not open, and the tab is left to the owner', async () => {
+  let page;
+  const fc = fakeChrome((url) => (page = new FakeSite('chatgpt', url, { neverFinish: true })));
+  const timers = fakeTimers();
+  const s = sender(fc, { timers });
+  const r = await s.send('chatgpt', { message: 'x', new_chat: true });
+  page.href = 'https://chatgpt.com/c/someone-elses-chat';
+  assert.deepEqual(await s.tabState('chatgpt', r.conversation_id), { open: false, generating: false, thinking: false, assistant_chars: 0 });
+  assert.deepEqual(fc.log.removed, [], 'a tab the owner moved was closed');
+  assert.equal(timers.pending().length, 0);
+  assert.equal(s.busy(), false);
 });
 
 test('a kept tab that can no longer be probed is closed at keepMs', async () => {
