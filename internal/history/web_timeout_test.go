@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/mvanhorn/agent-tincan/internal/client"
 	"github.com/mvanhorn/agent-tincan/internal/envelope"
 )
 
@@ -241,5 +243,69 @@ func TestWaitedText(t *testing.T) {
 		if got := waitedText(d); got != want {
 			t.Errorf("%s: %q, want %q", d, got, want)
 		}
+	}
+}
+
+// The journal drops an entry past its retention only once the relay says
+// its request is finished or no longer this agent's: a live request keeps
+// its entry however old, as does any entry while the relay cannot be read.
+// A recent entry is never looked up.
+func TestWebJournalKeepsEntriesUntilTheRelaySaysTheyAreSettled(t *testing.T) {
+	rig := newWebRig(t)
+	ctx := t.Context()
+	grok := rig.mesh.Client(t, "grokbot")
+	send := func(body string) string {
+		t.Helper()
+		req, err := grok.Send(ctx, "chatgpt-web", body, envelope.KindAsk, "", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req.ID
+	}
+	live := send("still waiting for its turn")
+	done := send("already answered")
+	if _, err := rig.agent.Relay.Claim(ctx, done); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.agent.Relay.Reply(ctx, done, "the answer", envelope.StatusAnswered); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-rig.agent.journalRetention() - time.Hour).UTC()
+	seed := map[string]webSend{
+		live:           {ConversationID: "conv-1", Recorded: old, Touched: old, State: webSendSent},
+		done:           {ConversationID: "conv-2", Recorded: old, State: webSendAnswered},
+		"req-unknown1": {ConversationID: "conv-3", Recorded: old, State: webSendSent},
+		"req-recent01": {ConversationID: "conv-4", Recorded: time.Now().UTC(), State: webSendSent},
+	}
+	for id, e := range seed {
+		rig.agent.journal(id, e)
+	}
+	keys := func() []string {
+		var out []string
+		for id := range rig.agent.loadJournal().Requests {
+			out = append(out, id)
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	// The relay unreachable: nothing is dropped.
+	reach := rig.agent.Relay
+	down, err := client.NewRelay("http://127.0.0.1:1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rig.agent.Relay = down
+	rig.agent.pruneSettledJournal(ctx)
+	if got := keys(); len(got) != 4 {
+		t.Fatalf("with the relay down the journal kept %v, want all four", got)
+	}
+
+	rig.agent.Relay = reach
+	rig.agent.pruneSettledJournal(ctx)
+	want := []string{live, "req-recent01"}
+	slices.Sort(want)
+	if got := keys(); !slices.Equal(got, want) {
+		t.Fatalf("journal after prune %v, want %v (the live request and the recent entry)", got, want)
 	}
 }

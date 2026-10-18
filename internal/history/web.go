@@ -124,8 +124,9 @@ type WebAgent struct {
 	// sends into, so history leaves them out of the owner's own
 	// conversations. Empty turns it off.
 	UsedPath string
-	// JournalRetention is how long a journal entry is kept
-	// (DefaultWebJournalRetention when zero).
+	// JournalRetention is how long after its last write a journal entry
+	// is kept before the relay is asked whether its request is finished;
+	// it is dropped only then (DefaultWebJournalRetention when zero).
 	JournalRetention time.Duration
 	// TempDir is where per-request image dirs are made (os.TempDir when
 	// empty).
@@ -536,6 +537,7 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.sendGeneration++
+	w.pruneSettledJournal(ctx)
 	images := len(req.Attachments) > 0
 	var j webJournal
 	if images {
@@ -636,7 +638,7 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 		}
 		send := func() (SendResult, error) {
 			return w.Native.sendImages(ctx, w.Site, OpArgs{Message: wr.message, ConversationID: convID, NewChat: newChat}, files, func() error {
-				e := webSend{ConversationID: convID, PrevUserID: anchor.prevUser, Recorded: time.Now().UTC(), SubmittedAt: time.Now().UTC(), State: webSendIntent, Input: true}
+				e := webSend{ConversationID: convID, PrevUserID: anchor.prevUser, Recorded: w.clk().Now().UTC(), SubmittedAt: time.Now().UTC(), State: webSendIntent, Input: true}
 				if err := w.journalStrict(req.ID, e); err != nil {
 					return errors.New("could not record image send intent; nothing was submitted")
 				}
@@ -709,7 +711,7 @@ func (w *WebAgent) Handle(ctx context.Context, req envelope.Request) {
 	if id := res.MessageID; id != "" && len(id) <= 128 && !strings.ContainsFunc(id, unicode.IsControl) {
 		anchor.bound = id
 	}
-	entry := webSend{ConversationID: res.ConversationID, PrevUserID: anchor.prevUser, SubmittedAt: anchor.since, UserMessageID: anchor.bound, Recorded: time.Now().UTC(), State: webSendSent, Input: images}
+	entry := webSend{ConversationID: res.ConversationID, PrevUserID: anchor.prevUser, SubmittedAt: anchor.since, UserMessageID: anchor.bound, Recorded: w.clk().Now().UTC(), State: webSendSent, Input: images}
 	if images {
 		if err := w.journalStrict(req.ID, entry); err != nil {
 			w.reply(ctx, req, "The image message was submitted, but its confirmation could not be saved. Do not retry automatically; inspect the conversation.", envelope.StatusFailed, nil)
