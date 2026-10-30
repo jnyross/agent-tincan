@@ -2,6 +2,7 @@ package wake
 
 import (
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,8 +52,18 @@ if [ -s "$statedir/tailscaled.state" ]; then echo Stopped; else echo NeedsLogin;
 // Tailscale keys (or <unset>), then stays up until it is killed. It records
 // nothing under FAKE_NO_RECORD, for a relay the test starts itself.
 const fakeTincanUp = `#!/bin/sh
+printf '%s|%s\n' "${1:-}" "${ALL_PROXY-<unset>}" >> "$FAKE_DIR/tincan.calls"
 case "${1:-}" in
-doctor) printf '%s' "${TINCAN_CONFIG-<unset>}" > "$FAKE_DIR/doctor.config"; exit 0;;
+agents)
+  n=$(cat "$FAKE_DIR/agents.count" 2>/dev/null || echo 0)
+  n=$((n + 1)); echo "$n" > "$FAKE_DIR/agents.count"
+  [ "$n" -gt "${FAKE_AGENTS_FAILURES:-0}" ]; exit $?;;
+doctor)
+  printf '%s' "${TINCAN_CONFIG-<unset>}" > "$FAKE_DIR/doctor.config"
+  n=$(cat "$FAKE_DIR/doctor.count" 2>/dev/null || echo 0)
+  n=$((n + 1)); echo "$n" > "$FAKE_DIR/doctor.count"
+  [ "$n" -gt "${FAKE_DOCTOR_FAILURES:-0}" ] || exit 1
+  exit "${FAKE_DOCTOR_EXIT:-0}";;
 relay)
   if [ -z "${FAKE_NO_RECORD:-}" ]; then
     printf '%s\n%s\n' "${TS_AUTHKEY-<unset>}" "${RELAY_TS_AUTHKEY-<unset>}" > "$FAKE_DIR/relay.env.tmp"
@@ -109,7 +120,8 @@ func newTincanUpHarness(t *testing.T) *tincanUpHarness {
 	h.write(filepath.Join(lib, "tailscale"), fakeTailscale, 0o755)
 	h.write(filepath.Join(lib, "tailscaled"), fakeTailscaled, 0o755)
 	h.write(h.tincan, strings.ReplaceAll(fakeTincanUp, "REAL_SLEEP", realSleep), 0o755)
-	h.write(filepath.Join(h.path, "sleep"), "#!/bin/sh\nexit 0\n", 0o755)
+	h.write(filepath.Join(h.path, "sleep"), "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_DIR/sleeps\"\n", 0o755)
+	h.write(filepath.Join(h.path, "timeout"), "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$FAKE_DIR/timeouts\"\nshift\nexec \"$@\"\n", 0o755)
 	h.write(filepath.Join(h.path, "pkill"), "#!/bin/sh\nexit 1\n", 0o755)
 	h.write(filepath.Join(h.path, "pgrep"), "#!/bin/sh\nfor p; do :; done\ngrep -Eq -e \"$p\" \"$FAKE_DIR/procs\"\n", 0o755)
 	h.write(filepath.Join(h.path, "ps"), "#!/bin/sh\ncase \" $* \" in *\" -e\"*) cat \"$FAKE_DIR/procs\"; exit 0;; esac\nexec "+realPS+" \"$@\"\n", 0o755)
@@ -517,4 +529,108 @@ func TestTincanUpRefusesSocketDaemonWithStateElsewhere(t *testing.T) {
 			t.Fatalf("exit %d, want 0\n%s", r.code, r.out)
 		}
 	})
+}
+
+func (h *tincanUpHarness) recorded(name string) string {
+	h.t.Helper()
+	raw, err := os.ReadFile(filepath.Join(h.fake, name))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func TestTincanUpProxyEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name, inherited, want string
+		listening, set        bool
+	}{
+		{name: "listening proxy", listening: true},
+		{name: "unavailable proxy", want: "<unset>"},
+		{name: "explicit proxy", listening: true, set: true, inherited: "socks5://caller.invalid:1234", want: "socks5://caller.invalid:1234"},
+		{name: "explicit empty", listening: true, set: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTincanUpHarness(t)
+			h.write(filepath.Join(h.fake, "ts.state"), "Running", 0o644)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := ln.Addr().String()
+			if tc.listening {
+				t.Cleanup(func() { _ = ln.Close() })
+			} else {
+				_ = ln.Close()
+			}
+			env := []string{"START_RELAY=0", "PROXY_ADDR=" + addr}
+			want := tc.want
+			if tc.set {
+				env = append(env, "ALL_PROXY="+tc.inherited)
+			} else if tc.listening {
+				want = "socks5://" + addr
+			}
+			r := h.run(env...)
+			if r.code != 0 {
+				t.Fatalf("exit %d, want 0\n%s", r.code, r.out)
+			}
+			if calls := h.recorded("tincan.calls"); calls != "agents|"+want+"\ndoctor|"+want+"\n" {
+				t.Errorf("client calls = %q, want warm-up then doctor with proxy %q", calls, want)
+			}
+		})
+	}
+}
+
+func TestTincanUpRelayWarmup(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		failures, doctor, code int
+		calls, sleeps          string
+	}{
+		{"ready", 0, 0, 0, "agents|<unset>\ndoctor|<unset>\n", ""},
+		{"second attempt", 1, 0, 0, "agents|<unset>\nagents|<unset>\ndoctor|<unset>\n", "2\n"},
+		{"last attempt", 2, 0, 0, "agents|<unset>\nagents|<unset>\nagents|<unset>\ndoctor|<unset>\n", "2\n4\n"},
+		{"exhausted", 3, 0, 1, "agents|<unset>\nagents|<unset>\nagents|<unset>\n", "2\n4\n"},
+		{"doctor problem", 0, 1, 1, strings.Repeat("agents|<unset>\ndoctor|<unset>\n", 3), "2\n4\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTincanUpHarness(t)
+			h.write(filepath.Join(h.fake, "ts.state"), "Running", 0o644)
+			r := h.run("START_RELAY=0", "FAKE_AGENTS_FAILURES="+strconv.Itoa(tc.failures), "FAKE_DOCTOR_EXIT="+strconv.Itoa(tc.doctor), "PROXY_ADDR=127.0.0.1:0")
+			if r.code != tc.code {
+				t.Fatalf("exit %d, want %d\n%s", r.code, tc.code, r.out)
+			}
+			if calls := h.recorded("tincan.calls"); calls != tc.calls {
+				t.Errorf("client calls = %q, want %q", calls, tc.calls)
+			}
+			sleeps := ""
+			if h.exists("sleeps") {
+				sleeps = h.recorded("sleeps")
+			}
+			if sleeps != tc.sleeps {
+				t.Errorf("backoff = %q, want %q", sleeps, tc.sleeps)
+			}
+			wantTimeouts := "2\n" + strings.NewReplacer("agents|<unset>\n", "45\n", "doctor|<unset>\n", "60\n").Replace(tc.calls)
+			if got, want := h.recorded("timeouts"), wantTimeouts; got != want {
+				t.Errorf("timeouts = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestTincanUpRetriesColdDoctorOnRelayHost(t *testing.T) {
+	h := newTincanUpHarness(t)
+	h.write(filepath.Join(h.fake, "ts.state"), "Running", 0o644)
+	// The roster may succeed through admin.sock while doctor's first network
+	// request still fails. It must get another attempt before exiting unhealthy.
+	r := h.run("START_RELAY=0", "FAKE_DOCTOR_FAILURES=1", "PROXY_ADDR=127.0.0.1:0")
+	if r.code != 0 {
+		t.Fatalf("exit %d, want 0\n%s", r.code, r.out)
+	}
+	if got, want := h.recorded("tincan.calls"), strings.Repeat("agents|<unset>\ndoctor|<unset>\n", 2); got != want {
+		t.Errorf("client calls = %q, want %q", got, want)
+	}
+	if got := h.recorded("sleeps"); got != "2\n" {
+		t.Errorf("backoff = %q, want 2s", got)
+	}
 }

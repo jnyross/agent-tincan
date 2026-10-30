@@ -58,14 +58,14 @@ One port serves both SOCKS5 and HTTP. Every `tailscale` command needs `--socket=
 
 ## 3. The startup script
 
-[`examples/grokbot/tincan-up.sh`](../../examples/grokbot/tincan-up.sh) lives in the agent-tincan repo. Copy it to `~/.local/bin/` and make it executable. It is idempotent and needs no sudo. It:
+[`examples/grokbot/tincan-up.sh`](../../examples/grokbot/tincan-up.sh) lives in the agent-tincan repo. Copy it to `~/.local/bin/` and make it executable. It is idempotent and needs no sudo. It runs on Linux with Bash and coreutils (`timeout` is used to bound connection probes and health checks). It:
 
 1. Installs `tailscale` and `tailscaled` into `~/.local/lib/tailscale` if they are missing. It downloads the static build from pkgs.tailscale.com and checks its sha256. Set `TS_VERSION` to pin a version. If the installed version differs from `TS_VERSION`, it installs the pinned one and restarts tailscaled.
 2. Starts tailscaled as above if nothing answers on the socket.
 3. Brings the node up. A node that still has its identity but is stopped comes up without a key. A logged-out node logs in only with `TS_AUTHKEY`, passed to `tailscale up` on stdin (`--auth-key=file:/dev/stdin`), so the key is never written to disk or shown in the process list. It never starts a browser login. It then waits for the node to be running. Settings: `TS_HOSTNAME` (default `grokbot`) and `TS_TAGS` (default `tag:grokbot`, which must match the key).
 4. Checks that `tincan` is installed at `~/.local/bin/tincan` (or `TINCAN`). A missing or non-executable `tincan` is unhealthy.
 5. With `START_RELAY=1`, starts `tincan relay` if no relay is running as this user, and checks that it stayed up. The relay always runs as its own tsnet node with its state in `~/.config/tincan-relay`, never with `--listen`, so it keeps its name and address when the box's own Tailscale is lost. `RELAY_ADMIN` sets its `--admin` list. `TS_AUTHKEY` is never passed to the relay. `RELAY_TS_AUTHKEY` is passed to it as its `TS_AUTHKEY` only while `~/.config/tincan-relay/tsnet` holds no identity yet, so the relay's first login uses its own tagged key. Read section 5 before using this.
-6. Runs `tincan doctor`.
+6. If `ALL_PROXY` is unset and the userspace proxy is listening, exports `ALL_PROXY=socks5://$PROXY_ADDR` for its Tincan calls (`PROXY_ADDR` defaults to `localhost:1055`). An explicitly set value, including an empty one, is preserved. Warms up the relay with `tincan agents` before running `tincan doctor`: the roster call has a 30-second API timeout, longer than doctor's 15-second relay probe, with a 45-second outer limit per attempt to include discovery. Each doctor run is capped at 60 seconds. It tries the sequence at most three times, waiting 2 then 4 seconds between failures, and reports unhealthy only after exhausting those attempts. Doctor failures are also retried because the roster may use a local admin socket on relay hosts, leaving doctor's first network probe cold. The export lasts only inside the script. Tincan's Go client still needs the saved `--proxy` setting below (or `TINCAN_PROXY`) to select a proxy; Go does not select one from `ALL_PROXY`.
 
 | Exit | Meaning | Fix |
 |---|---|---|

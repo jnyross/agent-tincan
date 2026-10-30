@@ -171,6 +171,19 @@ if [ ! -x "$TINCAN" ]; then
   echo "tincan not found or not executable at $TINCAN: install it (or set TINCAN to its path)"; exit 1
 fi
 
+# Userspace Tailscale has no host route into the tailnet. Adopt its proxy only
+# when it is listening and the caller has not set ALL_PROXY (even to empty).
+# Bound the TCP probe so a bad address cannot stall recovery.
+if [ "${ALL_PROXY+x}" != x ]; then
+  proxy_host=${PROXY_ADDR%:*}
+  proxy_host=${proxy_host#[}; proxy_host=${proxy_host%]}
+  proxy_port=${PROXY_ADDR##*:}
+  # shellcheck disable=SC2016 # $1/$2 belong to the probe's child shell.
+  if timeout 2 "$BASH" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$proxy_host" "$proxy_port" 2>/dev/null; then
+    export ALL_PROXY="socks5://$PROXY_ADDR"
+  fi
+fi
+
 # 5. Optional: the relay, if this host runs it, as its own tailnet node (tsnet, never --listen)
 #    with its identity in the home folder. TS_AUTHKEY is stripped so a lost relay state never
 #    silently registers the relay as a new node with this host's tag. RELAY_TS_AUTHKEY is handed
@@ -221,8 +234,30 @@ fi
 # 6. Tincan client check.
 if [ "$state" = Running ]; then
   echo "tailscale ok: $(tsc ip -4 2>/dev/null || true)"
-  if ! "$TINCAN" doctor >/dev/null 2>&1; then
-    echo "tincan doctor reported a problem: run tincan doctor"; [ "$rc" -eq 0 ] && rc=1
+  # The first tailnet request may need a cold DERP path. agents uses the
+  # client's 30s API timeout, longer than doctor's 15s relay probe; allow 45s
+  # including relay discovery. Retry at most three calls, with 2s/4s backoff.
+  # agents can use a local admin socket on relay hosts, so also retry doctor
+  # if its first network probe is cold. Bound each doctor run as well.
+  # Discard output: the roster and diagnostics need not enter routine logs.
+  relay_ready=0
+  problem="tincan relay unreachable"
+  for attempt in 1 2 3; do
+    if timeout 45 "$TINCAN" agents >/dev/null 2>&1; then
+      if timeout 60 "$TINCAN" doctor >/dev/null 2>&1; then
+        relay_ready=1; break
+      fi
+      problem="tincan doctor reported a problem"
+    else
+      problem="tincan relay unreachable"
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      echo "tincan relay warming up: retrying"
+      sleep "$((attempt * 2))"
+    fi
+  done
+  if [ "$relay_ready" = 0 ]; then
+    echo "$problem after 3 attempts: run tincan doctor"; [ "$rc" -eq 0 ] && rc=1
   fi
 fi
 exit "$rc"
